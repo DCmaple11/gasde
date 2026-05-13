@@ -12,8 +12,17 @@ import vip.mate.agent.binding.model.AgentToolBinding;
 import vip.mate.agent.binding.repository.AgentProviderPreferenceMapper;
 import vip.mate.agent.binding.repository.AgentSkillBindingMapper;
 import vip.mate.agent.binding.repository.AgentToolBindingMapper;
+import vip.mate.agent.model.AgentEntity;
+import vip.mate.agent.repository.AgentMapper;
+import vip.mate.exception.MateClawException;
+import vip.mate.skill.acp.AcpSkillBridge;
+import vip.mate.skill.mcp.McpSkillBridge;
+import vip.mate.skill.model.SkillEntity;
+import vip.mate.skill.repository.SkillMapper;
 import vip.mate.skill.runtime.SkillRuntimeService;
 import vip.mate.skill.runtime.model.ResolvedSkill;
+import vip.mate.tool.model.AvailableToolDTO;
+import vip.mate.tool.service.AvailableToolService;
 
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -43,16 +52,51 @@ public class AgentBindingService {
      * graph when SkillRuntimeService initializes after binding.
      */
     private final SkillRuntimeService skillRuntimeService;
+    /**
+     * Source of truth for what the picker can offer (built-in + MCP). Used
+     * by {@link #setToolBindings} to refuse new tool names that the runtime
+     * couldn't resolve anyway — closes the gap where a UI-disabled row
+     * could still be saved by hitting the API directly.
+     */
+    private final AvailableToolService availableToolService;
+    /**
+     * Direct mapper access (instead of {@code AgentService}) to look up an
+     * agent's workspace before binding a skill. {@code AgentService} pulls
+     * in {@code AgentGraphBuilder}, which itself depends on
+     * {@code AgentBindingService} — going through the service would create a
+     * boot-time cycle. The mapper has no such transitive dependency.
+     */
+    private final AgentMapper agentMapper;
+    /** Same reasoning as {@link #agentMapper}: skill workspace lookup. */
+    private final SkillMapper skillMapper;
+    /**
+     * ACP virtual skills aren't rows in {@code mate_skill}; the bridge
+     * synthesizes them from {@code mate_acp_endpoint}. We need this to
+     * answer "what workspace does this virtual id belong to?" when an
+     * agent tries to bind one. MCP virtual skills don't need a bridge
+     * reference — {@link McpSkillBridge#isVirtualMcpSkillId(Long)} is a
+     * static range check, and MCP servers carry no workspace today, so
+     * binding any MCP virtual id is allowed for any agent.
+     */
+    private final AcpSkillBridge acpSkillBridge;
 
     @Autowired
     public AgentBindingService(AgentSkillBindingMapper skillBindingMapper,
                                AgentToolBindingMapper toolBindingMapper,
                                AgentProviderPreferenceMapper providerPreferenceMapper,
-                               @Lazy SkillRuntimeService skillRuntimeService) {
+                               @Lazy SkillRuntimeService skillRuntimeService,
+                               AvailableToolService availableToolService,
+                               AgentMapper agentMapper,
+                               SkillMapper skillMapper,
+                               AcpSkillBridge acpSkillBridge) {
         this.skillBindingMapper = skillBindingMapper;
         this.toolBindingMapper = toolBindingMapper;
         this.providerPreferenceMapper = providerPreferenceMapper;
         this.skillRuntimeService = skillRuntimeService;
+        this.availableToolService = availableToolService;
+        this.agentMapper = agentMapper;
+        this.skillMapper = skillMapper;
+        this.acpSkillBridge = acpSkillBridge;
     }
 
     // ==================== Skill Bindings ====================
@@ -80,6 +124,7 @@ public class AgentBindingService {
     }
 
     public AgentSkillBinding bindSkill(Long agentId, Long skillId) {
+        requireSameWorkspace(agentId, skillId);
         // 检查是否已绑定
         AgentSkillBinding existing = skillBindingMapper.selectOne(
                 new LambdaQueryWrapper<AgentSkillBinding>()
@@ -109,6 +154,15 @@ public class AgentBindingService {
      * 批量设置 Agent 的 skill 绑定（替换模式）
      */
     public void setSkillBindings(Long agentId, List<Long> skillIds) {
+        // Validate every incoming skill BEFORE touching the binding rows;
+        // a half-applied save (old bindings dropped, new set rejected
+        // mid-loop) would leave the agent silently un-bound from skills it
+        // had a moment ago.
+        if (skillIds != null) {
+            for (Long skillId : skillIds) {
+                requireSameWorkspace(agentId, skillId);
+            }
+        }
         // 删除旧绑定
         skillBindingMapper.delete(
                 new LambdaQueryWrapper<AgentSkillBinding>()
@@ -122,6 +176,78 @@ public class AgentBindingService {
                 binding.setEnabled(true);
                 skillBindingMapper.insert(binding);
             }
+        }
+    }
+
+    /**
+     * Refuse to bind a skill that doesn't share the agent's workspace.
+     * Skills are per-workspace installable artifacts (each workspace has
+     * its own catalog under {@code mate_skill.workspace_id}); letting
+     * workspace A's agent bind workspace B's skill would leak capabilities
+     * — and prompt content — across the tenancy boundary.
+     *
+     * <p>Three skill id flavors to handle:
+     * <ul>
+     *   <li><b>Real {@code mate_skill} rows</b> — straight mapper lookup,
+     *       compare {@code workspace_id} to the agent's.</li>
+     *   <li><b>Virtual MCP-derived ids</b> ({@code >= McpSkillBridge.VIRTUAL_ID_BASE})
+     *       — pass through. MCP servers carry no workspace concept today,
+     *       so any agent in any workspace may bind any MCP virtual skill.
+     *       The picker (/skills/enabled) hands these out to every workspace.</li>
+     *   <li><b>Virtual ACP-derived ids</b> ({@code AcpSkillBridge}'s range)
+     *       — resolve through the bridge so the {@link SkillEntity#getWorkspaceId()}
+     *       comes from the backing {@code mate_acp_endpoint.workspace_id},
+     *       then apply the same workspace comparison.</li>
+     * </ul>
+     *
+     * <p>Most {@code mate_skill} rows currently sit in the default workspace
+     * (id=1) because skill creation doesn't yet honor the
+     * {@code X-Workspace-Id} header; the real-skill branch is therefore
+     * defense-in-depth right now and flips on automatically the moment
+     * workspace-scoped skill creation lands. ACP enforcement is live today.
+     *
+     * @throws MateClawException 404 if the agent or skill doesn't exist;
+     *                           403 on a workspace mismatch.
+     */
+    private void requireSameWorkspace(Long agentId, Long skillId) {
+        if (agentId == null) {
+            throw new MateClawException("err.agent.not_found", 404, "Agent ID is required");
+        }
+        if (skillId == null) {
+            throw new MateClawException("err.skill.not_found", 404, "Skill ID is required");
+        }
+        AgentEntity agent = agentMapper.selectById(agentId);
+        if (agent == null) {
+            throw new MateClawException("err.agent.not_found", 404, "Agent 不存在: " + agentId);
+        }
+        // MCP virtual: no workspace on McpServerEntity — globally bindable.
+        if (McpSkillBridge.isVirtualMcpSkillId(skillId)) {
+            return;
+        }
+        SkillEntity skill;
+        if (AcpSkillBridge.isVirtualAcpSkillId(skillId)) {
+            // ACP virtual: synthesize from the bridge so workspace_id flows
+            // through from mate_acp_endpoint. A null reply here means the
+            // backing endpoint was deleted or disabled between picker render
+            // and save — same surface as a deleted real skill.
+            skill = acpSkillBridge.findEntityById(skillId);
+            if (skill == null) {
+                throw new MateClawException("err.skill.not_found", 404,
+                        "ACP endpoint backing skill " + skillId + " is gone or disabled");
+            }
+        } else {
+            skill = skillMapper.selectById(skillId);
+            if (skill == null) {
+                throw new MateClawException("err.skill.not_found", 404, "Skill 不存在: " + skillId);
+            }
+        }
+        long agentWs = agent.getWorkspaceId() == null ? 1L : agent.getWorkspaceId();
+        long skillWs = skill.getWorkspaceId() == null ? 1L : skill.getWorkspaceId();
+        if (agentWs != skillWs) {
+            throw new MateClawException("err.skill.cross_workspace_binding", 403,
+                    "Skill " + skillId + " (workspace=" + skillWs
+                            + ") cannot be bound to Agent " + agentId
+                            + " (workspace=" + agentWs + ")");
         }
     }
 
@@ -175,6 +301,19 @@ public class AgentBindingService {
      *       → contribute nothing through this path; legacy SKILL.md prompt
      *       enhancement still runs separately.</li>
      * </ul>
+     *
+     * <p>Auto-included on every non-null result, in addition to the bound
+     * tools and skill-expanded tools:
+     * <ul>
+     *   <li>{@link #SYSTEM_LEVEL_TOOLS} — agent-wide primitives.</li>
+     *   <li>Every currently-bindable MCP tool (any tool with
+     *       {@code source="mcp"} and {@code available=true} in the picker).
+     *       MCP servers are administrator-level capabilities; once enabled
+     *       globally they should not be silently hidden from an agent that
+     *       happens to have any other binding. To deny a specific MCP tool
+     *       to a specific agent, use the tool-guard deny path applied
+     *       upstream in {@code AgentGraphBuilder}.</li>
+     * </ul>
      */
     public Set<String> getEffectiveToolNames(Long agentId) {
         Set<Long> boundSkillIds = getBoundSkillIds(agentId);
@@ -216,7 +355,39 @@ public class AgentBindingService {
         // (the LLM stops being able to write to LESSONS.md / MEMORY.md).
         merged.addAll(SYSTEM_LEVEL_TOOLS);
 
+        // Enabled MCP server tools auto-join the allowlist for the same
+        // reason SYSTEM_LEVEL_TOOLS does: MCP servers are an
+        // administrator-enabled capability, not a per-agent opt-in. Without
+        // this union, an agent with any skill or built-in tool bound would
+        // silently lose every MCP tool — users hit this when they bound one
+        // built-in tool, didn't tick the MCP rows, and observed "only
+        // built-in tools work". Operators who need to hide a specific MCP
+        // tool from a specific agent still have the tool-guard deny path
+        // (AgentGraphBuilder applies withDeniedToolsFiltered before this).
+        merged.addAll(getEnabledMcpToolNames());
+
         return merged;
+    }
+
+    /**
+     * Names of every currently-bindable MCP tool, sourced from the same
+     * picker that the agent edit screen reads. Failures (picker outage,
+     * cache parse error) yield an empty set so the caller's allowlist is
+     * strictly narrower, never wider, than the picker — never throws.
+     */
+    private Set<String> getEnabledMcpToolNames() {
+        try {
+            return availableToolService.listAvailable().stream()
+                    .filter(t -> "mcp".equals(t.getSource()))
+                    .filter(AvailableToolDTO::isAvailable)
+                    .map(AvailableToolDTO::getName)
+                    .filter(n -> n != null && !n.isBlank())
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+        } catch (Exception e) {
+            log.warn("AvailableToolService unavailable while computing effective tool allowlist; "
+                    + "MCP tools will be excluded for this resolve cycle: {}", e.getMessage());
+            return Collections.emptySet();
+        }
     }
 
     /**
@@ -277,6 +448,11 @@ public class AgentBindingService {
             "image_generate",
             "music_generate",
             "video_generate",
+            // HTML → PNG rasteriser. Closes the loop for HTML-producing skills
+            // (architecture-diagram, infographics, dashboards) so IM channels
+            // can deliver the artifact as a native image instead of a file or
+            // a dead markdown link.
+            "render_html_image",
             // Universal capabilities the global system prompts (SOUL.md /
             // AGENTS.md / "Web Search Capability" / "File Reading Guidelines")
             // explicitly tell the LLM exist. Pre-Phase-2b they were globally
@@ -335,9 +511,27 @@ public class AgentBindingService {
     }
 
     /**
-     * 批量设置 Agent 的 tool 绑定（替换模式）
+     * Replace the agent's tool binding set.
+     *
+     * <p>Validation rule for each incoming name:
+     * <ul>
+     *   <li><b>Already in the existing binding</b> → always allowed (so the
+     *       user can keep a previously-bound tool whose upstream MCP server
+     *       is currently stale or even removed; the client just keeps what
+     *       it already had).</li>
+     *   <li><b>New addition (not in existing binding)</b> → must appear in
+     *       {@link AvailableToolService#listAvailable()} with
+     *       {@code available == true}. Names that are unknown
+     *       (typos / legacy unprefixed MCP names / hand-crafted strings) or
+     *       that the picker marked unavailable (hash collision, etc.) are
+     *       rejected — saving them would put a {@code mate_agent_tool} row
+     *       in the database that the runtime can never resolve, which then
+     *       silently drops the tool when the agent runs.</li>
+     * </ul>
      */
     public void setToolBindings(Long agentId, List<String> toolNames) {
+        validateNewToolBindings(agentId, toolNames);
+
         toolBindingMapper.delete(
                 new LambdaQueryWrapper<AgentToolBinding>()
                         .eq(AgentToolBinding::getAgentId, agentId));
@@ -349,6 +543,56 @@ public class AgentBindingService {
                 binding.setEnabled(true);
                 toolBindingMapper.insert(binding);
             }
+        }
+    }
+
+    /**
+     * Refuse the save when any *newly-added* tool name doesn't resolve to
+     * an {@code available=true} row in the picker. Names already in the
+     * existing binding are exempt so that subsequent edits (especially
+     * "remove this stale tool") still succeed even if upstream state has
+     * drifted.
+     */
+    private void validateNewToolBindings(Long agentId, List<String> incoming) {
+        if (incoming == null || incoming.isEmpty()) {
+            return;
+        }
+        Set<String> existing = listToolBindings(agentId).stream()
+                .map(AgentToolBinding::getToolName)
+                .collect(Collectors.toSet());
+        Set<String> bindable;
+        try {
+            bindable = availableToolService.listAvailable().stream()
+                    .filter(AvailableToolDTO::isAvailable)
+                    .map(AvailableToolDTO::getName)
+                    .collect(Collectors.toSet());
+        } catch (Exception e) {
+            // The picker source briefly failing must not block the user
+            // from saving a binding that's still in their existing set.
+            // Re-validate everything against just the existing set —
+            // strictly conservative: only allow keeps, refuse adds.
+            log.warn("AvailableToolService unavailable during binding validation, falling back to existing-only: {}",
+                    e.getMessage());
+            bindable = Set.of();
+        }
+
+        List<String> rejected = new java.util.ArrayList<>();
+        for (String name : incoming) {
+            if (name == null || name.isBlank()) {
+                rejected.add("<blank>");
+                continue;
+            }
+            if (existing.contains(name)) continue; // keeps are always allowed
+            if (!bindable.contains(name)) rejected.add(name);
+        }
+        if (!rejected.isEmpty()) {
+            String preview = rejected.size() <= 5
+                    ? String.join(", ", rejected)
+                    : String.join(", ", rejected.subList(0, 5)) + " (+" + (rejected.size() - 5) + " more)";
+            throw new MateClawException("err.agent.tool_binding_unbindable",
+                    "Tool name(s) cannot be bound: " + preview
+                            + ". Either the name is unknown or the picker marked it unavailable "
+                            + "(e.g. hash collision, upstream server removed).");
         }
     }
 

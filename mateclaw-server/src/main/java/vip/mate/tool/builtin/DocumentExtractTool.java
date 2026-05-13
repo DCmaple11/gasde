@@ -19,13 +19,15 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 /**
- * 文档文本提取工具
- * 支持 PDF、DOCX、XLSX、PPTX 等 Office 文档的文本提取
- * 实现 fallback 链：系统命令 -> Java 实现 -> 结构化错误
+ * Document text extraction tool.
+ * Supports PDF, DOCX, XLSX, PPTX with format-specific fallback chains.
  *
- * 实现策略：
- * - PDF: pdftotext -> pypdf/pdfplumber (Java 实现)
- * - DOCX: textutil/pandoc -> ZIP XML 解析
+ * Strategy by format:
+ * - PDF:       pdftotext -> pdfplumber/pypdf -> pdfbox -> OCR (scanned) -> Tika
+ * - DOCX:      textutil / pandoc / libreoffice -> ZIP+XML -> Tika
+ * - XLSX/PPTX: Tika directly (POI-based; correctly resolves the shared-strings
+ *              indirection table and walks SmartArt / chart / grouped-shape
+ *              text that a naive ZIP+XML scan misses).
  */
 @Slf4j
 @Component
@@ -45,12 +47,11 @@ public class DocumentExtractTool {
         - Excel (.xlsx, .xls) - 提取为文本表格
         - PowerPoint (.pptx, .ppt)
 
-        提取策略（默认自动选择最优方式）：
-        1. 优先使用系统命令（pdftotext, textutil, pandoc 等）
-        2. 系统命令不可用时使用纯 Java 实现
-        3. PDF 扫描版进入 OCR
-        4. 全部失败前用 Apache Tika 兜底（覆盖 SmartArt、共享字符串表等盲区）
-        5. 返回详细的提取过程和元数据
+        提取策略（按格式分链）：
+        - PDF:       pdftotext → pdfplumber/pypdf → pdfbox → OCR（扫描版） → Tika
+        - DOCX:      textutil / pandoc / libreoffice → ZIP-XML → Tika
+        - XLSX/PPTX: 直接走 Tika（基于 POI，正确解析 sharedStrings 表与 SmartArt / 图表文本）
+        - 返回详细的提取过程和元数据
 
         参数 options 可包含：
         - pages: 指定页码范围（如 "1-5" 或 "1,3,5"）
@@ -212,13 +213,12 @@ public class DocumentExtractTool {
         long t0 = System.currentTimeMillis();
         String content = tryPdftotext(path, options);
         if (content != null && !content.isBlank()) {
-            if (!needsOcr(content, realPageCount)) {
+            ExtractionQuality q = classifyExtraction(content, realPageCount);
+            if (!q.needsOcr()) {
                 attempts.add("pdftotext: 成功 (" + (System.currentTimeMillis() - t0) + "ms)");
                 return new ExtractedContent(content, "pdftotext", realPageCount > 0 ? realPageCount : estimatePages(content));
             }
-            double perPage = realPageCount > 0 ? (double) content.strip().length() / realPageCount : 0;
-            attempts.add("pdftotext: 文本过少 (总 " + content.strip().length() + " 字符, "
-                    + realPageCount + " 页, 每页 " + String.format("%.0f", perPage) + " 字符)，可能是扫描版");
+            attempts.add("pdftotext: 触发 OCR (" + describeTrigger(q, content.strip().length(), realPageCount) + ")");
             bestContent = content;
             bestMethod = "pdftotext";
         } else {
@@ -229,11 +229,12 @@ public class DocumentExtractTool {
         long t1 = System.currentTimeMillis();
         content = tryPythonPdfExtractor(path, options);
         if (content != null && !content.isBlank()) {
-            if (!needsOcr(content, realPageCount)) {
+            ExtractionQuality q = classifyExtraction(content, realPageCount);
+            if (!q.needsOcr()) {
                 attempts.add("python_pdf: 成功 (" + (System.currentTimeMillis() - t1) + "ms)");
                 return new ExtractedContent(content, "python_pdfplumber", realPageCount > 0 ? realPageCount : estimatePages(content));
             }
-            attempts.add("python_pdf: 文本过少");
+            attempts.add("python_pdf: 触发 OCR (" + describeTrigger(q, content.strip().length(), realPageCount) + ")");
             if (bestContent == null || content.strip().length() > bestContent.strip().length()) {
                 bestContent = content;
                 bestMethod = "python_pdfplumber";
@@ -246,11 +247,12 @@ public class DocumentExtractTool {
         long t2 = System.currentTimeMillis();
         content = extractPdfWithJava(path);
         if (content != null && !content.isBlank()) {
-            if (!needsOcr(content, realPageCount)) {
+            ExtractionQuality q = classifyExtraction(content, realPageCount);
+            if (!q.needsOcr()) {
                 attempts.add("java_pdf: 成功 (" + (System.currentTimeMillis() - t2) + "ms)");
                 return new ExtractedContent(content, "java_pdfbox", realPageCount > 0 ? realPageCount : estimatePages(content));
             }
-            attempts.add("java_pdf: 文本过少");
+            attempts.add("java_pdf: 触发 OCR (" + describeTrigger(q, content.strip().length(), realPageCount) + ")");
             if (bestContent == null || content.strip().length() > bestContent.strip().length()) {
                 bestContent = content;
                 bestMethod = "java_pdfbox";
@@ -324,22 +326,99 @@ public class DocumentExtractTool {
         return 0; // 未知页数
     }
 
+    /** Fraction below which extracted text is judged unreadable and an OCR pass is forced. */
+    static final double READABLE_RATIO_THRESHOLD = 0.5;
+
+    /** Outcome of {@link #classifyExtraction}; {@link #trigger()} is {@code null} when usable. */
+    record ExtractionQuality(String trigger, double readableRatio, double charsPerPage) {
+        boolean needsOcr() { return trigger != null; }
+    }
+
     /**
-     * 判断提取到的文本是否太少、需要尝试 OCR。
-     * 使用真实页数（来自 getPdfPageCount）计算字符密度，不再依赖 estimatePages 反推。
-     * 页数未知（0）时，只看总字符数。
+     * Classify the quality of a text extraction pass.
+     * <p>
+     * Three failure modes can fire an OCR retry:
+     * <ul>
+     *   <li>{@code empty} / {@code too_short}: nothing extracted, typical of image-only PDFs.</li>
+     *   <li>{@code low_readable_ratio}: extractor returned plenty of characters but most of
+     *       them are control bytes / high-Latin junk — typical of CID-encoded fonts without
+     *       a {@code ToUnicode} CMap, where the engine dumps glyph indices as bytes.</li>
+     *   <li>{@code low_char_density}: per-page char count is far below what a real text PDF
+     *       would yield, typical of scanned PDFs with a thin OCR layer applied upstream.</li>
+     * </ul>
      */
-    private boolean needsOcr(String text, int realPageCount) {
-        if (text == null || text.isBlank()) return true;
-        String stripped = text.strip();
-        if (stripped.length() < 20) return true;
-        if (realPageCount <= 0) {
-            // 页数未知时回退到总字符数判定（保守阈值）
-            return stripped.length() < 100;
+    static ExtractionQuality classifyExtraction(String text, int realPageCount) {
+        if (text == null || text.isBlank()) {
+            return new ExtractionQuality("empty", 0.0, 0.0);
         }
-        double perPage = (double) stripped.length() / realPageCount;
-        // 正常文本 PDF 每页至少数百字符；每页不到 30 字符大概率是扫描版
-        return perPage < 30;
+        String stripped = text.strip();
+        if (stripped.length() < 20) {
+            return new ExtractionQuality("too_short", 0.0, 0.0);
+        }
+        double ratio = readableRatio(stripped);
+        double perPage = realPageCount > 0
+                ? (double) stripped.length() / realPageCount
+                : stripped.length();
+        if (ratio < READABLE_RATIO_THRESHOLD) {
+            return new ExtractionQuality("low_readable_ratio", ratio, perPage);
+        }
+        if (realPageCount <= 0) {
+            // Page count unknown — fall back to a conservative total-length cutoff.
+            if (stripped.length() < 100) {
+                return new ExtractionQuality("too_short", ratio, perPage);
+            }
+        } else if (perPage < 30) {
+            return new ExtractionQuality("low_char_density", ratio, perPage);
+        }
+        return new ExtractionQuality(null, ratio, perPage);
+    }
+
+    /**
+     * Fraction of code points that are obviously readable: ASCII printable, tab/newline,
+     * CJK Unified Ideographs (+ ext A), CJK punctuation, halfwidth/fullwidth forms,
+     * hiragana/katakana, hangul syllables. Returns 0 for empty input.
+     * <p>
+     * The threshold {@link #READABLE_RATIO_THRESHOLD} separates real-world noisy
+     * extraction (well above 0.7 even with OCR errors) from font-encoding garbage,
+     * which typically lands below 0.1 because the bytes fall outside every script range.
+     */
+    static double readableRatio(String text) {
+        if (text == null || text.isEmpty()) return 0.0;
+        int total = 0, good = 0;
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            i += Character.charCount(cp);
+            total++;
+            if (isReadable(cp)) good++;
+        }
+        return total == 0 ? 0.0 : (double) good / total;
+    }
+
+    /** Compact one-line summary of why an extraction was rejected, for the attempts log. */
+    private static String describeTrigger(ExtractionQuality q, int totalChars, int realPageCount) {
+        return switch (q.trigger()) {
+            case "low_readable_ratio" -> String.format(
+                    "readable=%.2f<%.2f, %d 字符多为非可读字节，可能是字体编码异常",
+                    q.readableRatio(), READABLE_RATIO_THRESHOLD, totalChars);
+            case "low_char_density" -> String.format(
+                    "每页 %.0f 字符（总 %d, %d 页），可能是扫描版",
+                    q.charsPerPage(), totalChars, realPageCount);
+            case "too_short" -> "总 " + totalChars + " 字符，文本过少";
+            case "empty" -> "提取结果为空";
+            default -> "trigger=" + q.trigger();
+        };
+    }
+
+    private static boolean isReadable(int cp) {
+        if (cp == 9 || cp == 10 || cp == 13) return true;
+        if (cp >= 0x20 && cp <= 0x7E) return true;     // ASCII printable
+        if (cp >= 0x3000 && cp <= 0x303F) return true; // CJK punctuation
+        if (cp >= 0x3040 && cp <= 0x30FF) return true; // hiragana / katakana
+        if (cp >= 0x3400 && cp <= 0x4DBF) return true; // CJK ext A
+        if (cp >= 0x4E00 && cp <= 0x9FFF) return true; // CJK unified
+        if (cp >= 0xAC00 && cp <= 0xD7AF) return true; // hangul syllables
+        if (cp >= 0xFF00 && cp <= 0xFFEF) return true; // halfwidth / fullwidth
+        return false;
     }
 
     /** OCR 结果（含成功/失败页数统计） */
@@ -743,90 +822,51 @@ public class DocumentExtractTool {
     // ==================== XLSX 提取 ====================
 
     private ExtractedContent extractXlsx(Path path, String options, List<String> attempts) throws Exception {
-        StringBuilder text = new StringBuilder();
-
-        try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(path))) {
-            ZipEntry entry;
-            while ((entry = zis.getNextEntry()) != null) {
-                if (entry.getName().startsWith("xl/worksheets/sheet") && entry.getName().endsWith(".xml")) {
-                    String xml = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                    text.append("--- ").append(entry.getName()).append(" ---\n");
-                    text.append(extractTextFromXlsxXml(xml)).append("\n");
-                }
-            }
+        long t = System.currentTimeMillis();
+        String text = TikaExtractor.extract(path);
+        long elapsed = System.currentTimeMillis() - t;
+        if (text != null && !text.isBlank()) {
+            attempts.add("tika: 成功 (" + elapsed + "ms)");
+            return new ExtractedContent(text, "tika", 0);
         }
-
-        // Our ZIP-XML extractor only reads <v> tags and skips the shared-strings table,
-        // so cells full of text labels look "empty". When that happens, fall through to
-        // Tika which knows how to resolve the shared-strings indirection.
-        if (text.toString().replaceAll("---.*?---", "").strip().isEmpty()) {
-            String fallback = TikaExtractor.extract(path);
-            if (fallback != null && !fallback.isBlank()) {
-                attempts.add("tika: 成功（ZIP-XML 仅有数字 / 共享字符串未解析）");
-                return new ExtractedContent(fallback, "tika", 0);
-            }
-        }
-
-        attempts.add("java_zip_xml: 成功");
-        return new ExtractedContent(text.toString(), "java_zip_xml", 0);
-    }
-
-    private String extractTextFromXlsxXml(String xml) {
-        StringBuilder text = new StringBuilder();
-        int start = 0;
-        while ((start = xml.indexOf("<v>", start)) != -1) {
-            int end = xml.indexOf("</v>", start);
-            if (end == -1) break;
-            String value = xml.substring(start + 3, end);
-            text.append(value).append("\t");
-            start = end + 4;
-        }
-        return text.toString();
+        attempts.add("tika: 失败或不可用 (" + elapsed + "ms)");
+        throw new Exception("XLSX 提取失败：Tika 无法解析（文件可能损坏、加密或非标准格式）");
     }
 
     // ==================== PPTX 提取 ====================
 
     private ExtractedContent extractPptx(Path path, String options, List<String> attempts) throws Exception {
-        StringBuilder text = new StringBuilder();
-        int slideNum = 1;
-
-        try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(path))) {
-            ZipEntry entry;
-            while ((entry = zis.getNextEntry()) != null) {
-                if (entry.getName().startsWith("ppt/slides/slide") && entry.getName().endsWith(".xml")) {
-                    String xml = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                    text.append("--- Slide ").append(slideNum++).append(" ---\n");
-                    text.append(extractTextFromPptxXml(xml)).append("\n\n");
-                }
-            }
+        long t = System.currentTimeMillis();
+        String text = TikaExtractor.extract(path);
+        long elapsed = System.currentTimeMillis() - t;
+        if (text != null && !text.isBlank()) {
+            attempts.add("tika: 成功 (" + elapsed + "ms)");
+            int slides = countPptxSlides(path);
+            return new ExtractedContent(text, "tika", slides);
         }
-
-        // Slide layouts with text inside SmartArt / charts / grouped shapes don't surface
-        // through the simple <a:t> grep — Tika walks the full DrawingML graph and pulls
-        // them out. Only invoke when our walker produced nothing useful.
-        if (text.toString().replaceAll("---.*?---", "").strip().isEmpty()) {
-            String fallback = TikaExtractor.extract(path);
-            if (fallback != null && !fallback.isBlank()) {
-                attempts.add("tika: 成功（ZIP-XML 未抓到正文，可能是 SmartArt / 图表）");
-                return new ExtractedContent(fallback, "tika", Math.max(0, slideNum - 1));
-            }
-        }
-
-        attempts.add("java_zip_xml: 成功");
-        return new ExtractedContent(text.toString(), "java_zip_xml", Math.max(0, slideNum - 1));
+        attempts.add("tika: 失败或不可用 (" + elapsed + "ms)");
+        throw new Exception("PPTX 提取失败：Tika 无法解析（文件可能损坏、加密或非标准格式）");
     }
 
-    private String extractTextFromPptxXml(String xml) {
-        StringBuilder text = new StringBuilder();
-        int start = 0;
-        while ((start = xml.indexOf("<a:t>", start)) != -1) {
-            int end = xml.indexOf("</a:t>", start);
-            if (end == -1) break;
-            String txt = xml.substring(start + 5, end);
-            text.append(txt).append(" ");
-            start = end + 6;
+    /**
+     * Cheap slide count for the result metadata. Counts {@code ppt/slides/slideN.xml}
+     * entries in the OOXML zip without parsing the slide content. Returns 0 if the
+     * file isn't a readable zip.
+     */
+    private int countPptxSlides(Path path) {
+        int count = 0;
+        try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(path))) {
+            ZipEntry e;
+            while ((e = zis.getNextEntry()) != null) {
+                String name = e.getName();
+                if (name.startsWith("ppt/slides/slide") && name.endsWith(".xml")) {
+                    count++;
+                }
+            }
+        } catch (IOException ignored) {
+            // Slide count is best-effort metadata; never fail the extract on this.
         }
-        return text.toString().trim();
+        return count;
     }
 
     // ==================== 工具方法 ====================

@@ -1,6 +1,8 @@
 package vip.mate.channel;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import vip.mate.agent.AgentService;
@@ -8,6 +10,7 @@ import vip.mate.agent.context.ChatOrigin;
 import vip.mate.approval.ApprovalWorkflowService;
 import vip.mate.approval.ResolveOutcome;
 import vip.mate.approval.PendingApproval;
+import vip.mate.channel.event.ChannelMessageReceivedEvent;
 import vip.mate.channel.model.ChannelEntity;
 import vip.mate.channel.notification.ApprovalNotificationService;
 import vip.mate.channel.service.ChannelService;
@@ -59,6 +62,11 @@ public class ChannelMessageRouter {
     private final ChatStreamTracker streamTracker;
     private final ChannelChatOriginFactory chatOriginFactory;
     private final ChannelErrorClassifier errorClassifier;
+    /** Field-injected (rather than constructor) to avoid a signature
+     *  change that would ripple through every test that constructs the
+     *  router directly. Spring's stock publisher is always available. */
+    @Autowired(required = false)
+    private ApplicationEventPublisher events;
 
     /** 队列条目：封装消息及其路由上下文 */
     private record QueueEntry(ChannelMessage message, ChannelAdapter adapter, ChannelEntity channelEntity) {}
@@ -88,8 +96,47 @@ public class ChannelMessageRouter {
     /** 每个渠道的队列容量 */
     private static final int QUEUE_CAPACITY = 1000;
 
-    /** 防抖等待时间（毫秒） */
-    private static final long DEBOUNCE_MS = 500;
+    /** 防抖等待时间（毫秒）。Package-private for unit-test access. */
+    static final long DEBOUNCE_MS = 500;
+
+    /**
+     * Extended debounce window for suspected paste-split scenarios. WeCom
+     * (and other IM clients) silently split a single pasted long prompt
+     * into 2-4 separate messages when it exceeds the per-frame limit
+     * (~2000 chars). The fragments arrive 0.5-2s apart, which means the
+     * default {@link #DEBOUNCE_MS} flushes the first fragment before the
+     * second one arrives — the agent then sees a torn context, calls the
+     * LLM on a partial prompt, and gets re-triggered when the next
+     * fragment lands. When merged content exceeds
+     * {@link #LONG_TEXT_THRESHOLD} we extend the window so the merger has
+     * time to absorb the rest.
+     * <p>
+     * Package-private for unit-test access.
+     */
+    static final long LONG_DEBOUNCE_MS = 2500;
+
+    /**
+     * Content length (chars) above which we treat the message as a likely
+     * paste-split fragment. 1500 sits below the typical ~2000-char IM
+     * client split point while staying well above any normally-typed
+     * message, so the long-debounce path doesn't penalize ordinary
+     * chatting. A short typed "hello" still flushes in 500ms.
+     * <p>
+     * Package-private for unit-test access.
+     */
+    static final int LONG_TEXT_THRESHOLD = 1500;
+
+    /**
+     * Pick the debounce window: extend to {@link #LONG_DEBOUNCE_MS} when
+     * either the new arrival or the accumulated merged buffer looks like
+     * a paste-split fragment, otherwise stay at {@link #DEBOUNCE_MS}.
+     * <p>
+     * Package-private + static so tests can pin the threshold without
+     * spinning up the whole router (which has 12+ injected dependencies).
+     */
+    static long pickDebounceMs(int currentMergedLength) {
+        return currentMergedLength > LONG_TEXT_THRESHOLD ? LONG_DEBOUNCE_MS : DEBOUNCE_MS;
+    }
 
     /**
      * Plan-Execute SSE events that the Web Console mirror needs to see when
@@ -189,6 +236,14 @@ public class ChannelMessageRouter {
      * @param channelEntity 渠道配置（含关联 agentId）
      */
     public void enqueue(ChannelMessage message, ChannelAdapter adapter, ChannelEntity channelEntity) {
+        // Fan out to the trigger pipeline FIRST — channel_message and
+        // content_match triggers fire on every received message regardless
+        // of whether the channel has an agent attached. If we returned
+        // early on a missing agent below without publishing, the workflow
+        // side would silently lose every channel-event that doesn't also
+        // route to a chat agent.
+        publishChannelEvent(message, adapter, channelEntity);
+
         Long agentId = channelEntity.getAgentId();
         if (agentId == null) {
             log.warn("Channel {} has no associated agent, ignoring message from {}",
@@ -207,27 +262,101 @@ public class ChannelMessageRouter {
         log.info("[{}] Enqueuing message: sender={}, conversationId={}, agentId={}",
                 channelType, message.getSenderId(), conversationId, agentId);
 
-        // 防抖：同一会话 500ms 内的连续消息合并
+        // Debounce + adaptive merge: same conversation messages within the
+        // (500ms / 2.5s) window get concatenated into one. Adaptive: when
+        // the merged buffer crosses the LONG_TEXT_THRESHOLD we extend to
+        // LONG_DEBOUNCE_MS so paste-split fragments arrive together
+        // instead of triggering one agent call per piece.
         synchronized (pendingMessages) {
             PendingMessage existing = pendingMessages.get(conversationId);
             if (existing != null) {
-                // 合并到已有的 pending 消息
-                if (existing.timer != null) {
-                    existing.timer.cancel(false);
+                // Sender boundary in groups: when a different user sends to the
+                // same group within the debounce window, merging would attribute
+                // both fragments to whoever sent first — the LLM then loses the
+                // ability to tell who asked what. Flush the existing buffer
+                // immediately so each user's text rides its own pending window.
+                // Reentrant on `pendingMessages`, so the inner flushPending's
+                // synchronized block re-acquires safely on the same thread.
+                String existingSender = existing.firstMessage.getSenderId();
+                String incomingSender = message.getSenderId();
+                boolean sameSender = isSameSender(existingSender, incomingSender);
+                if (!sameSender) {
+                    log.info("[{}] Sender boundary in conversation {}: flushing pending from sender={}, accepting new sender={}",
+                            channelType, conversationId, existingSender, incomingSender);
+                    if (existing.timer != null) {
+                        existing.timer.cancel(false);
+                    }
+                    flushPending(conversationId);
+                    // Fall through to create a fresh pending for the new sender.
+                } else {
+                    // Same sender — original paste-split / rapid-follow merge path.
+                    if (existing.timer != null) {
+                        existing.timer.cancel(false);
+                    }
+                    existing.appendContent(message.getContent());
+                    int mergedLen = existing.getMergedContent().length();
+                    long debounceMs = pickDebounceMs(mergedLen);
+                    existing.timer = debounceScheduler.schedule(
+                            () -> flushPending(conversationId), debounceMs, TimeUnit.MILLISECONDS);
+                    if (debounceMs > DEBOUNCE_MS) {
+                        log.info("[{}] Long-text merger active: conversationId={}, mergedLen={}, debounce={}ms (paste-split suspected)",
+                                channelType, conversationId, mergedLen, debounceMs);
+                    } else {
+                        log.debug("[{}] Message merged with pending (debounce {}ms): conversationId={}",
+                                channelType, debounceMs, conversationId);
+                    }
+                    return;
                 }
-                existing.appendContent(message.getContent());
-                existing.timer = debounceScheduler.schedule(
-                        () -> flushPending(conversationId), DEBOUNCE_MS, TimeUnit.MILLISECONDS);
-                log.debug("[{}] Message merged with pending (debounce): conversationId={}",
-                        channelType, conversationId);
-                return;
             }
 
-            // 首条消息，创建 PendingMessage 并设定防抖定时器
+            // 首条消息（或 sender boundary 之后的新 sender），创建 PendingMessage 并设定防抖定时器
             PendingMessage pending = new PendingMessage(message, adapter, channelEntity);
             pendingMessages.put(conversationId, pending);
+            int firstLen = message.getContent() != null ? message.getContent().length() : 0;
+            long debounceMs = pickDebounceMs(firstLen);
             pending.timer = debounceScheduler.schedule(
-                    () -> flushPending(conversationId), DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+                    () -> flushPending(conversationId), debounceMs, TimeUnit.MILLISECONDS);
+            if (debounceMs > DEBOUNCE_MS) {
+                log.info("[{}] Long-text merger armed on first message: conversationId={}, len={}, debounce={}ms",
+                        channelType, conversationId, firstLen, debounceMs);
+            }
+        }
+    }
+
+    /**
+     * Publish a {@link ChannelMessageReceivedEvent} so the trigger module's
+     * bridge can fan the message out to channel_message + content_match
+     * triggers. Best-effort — a publish failure must never block the
+     * primary chat-routing path. {@code messageId} is used as the dedup
+     * key downstream so repeated webhook deliveries can't double-fire
+     * the same trigger.
+     */
+    private void publishChannelEvent(ChannelMessage message, ChannelAdapter adapter,
+                                     ChannelEntity channelEntity) {
+        if (events == null || message == null || adapter == null || channelEntity == null) return;
+        try {
+            long ws = channelEntity.getWorkspaceId() == null ? 0L : channelEntity.getWorkspaceId();
+            String channelType = adapter.getChannelType();
+            // messageId may be null for adapters that don't surface one;
+            // fall back to a sender+timestamp composite so the dedup key
+            // is at least deterministic-ish per webhook delivery.
+            String messageId = message.getMessageId();
+            if (messageId == null || messageId.isBlank()) {
+                messageId = channelType + ":" + message.getSenderId() + ":"
+                        + (message.getTimestamp() == null ? System.currentTimeMillis()
+                                                          : message.getTimestamp());
+            }
+            events.publishEvent(new ChannelMessageReceivedEvent(
+                    ws,
+                    channelType,
+                    messageId,
+                    message.getSenderId(),
+                    message.getSenderName(),
+                    message.getChatId(),
+                    message.getContent()));
+        } catch (Exception e) {
+            log.warn("[ChannelMessageRouter] event publish failed for sender {}: {}",
+                    message.getSenderId(), e.getMessage());
         }
     }
 
@@ -416,7 +545,10 @@ public class ChannelMessageRouter {
                     ResolveOutcome denyOutcome = approvalService.resolve(
                             pending.getPendingId(), message.getSenderId(), "denied");
                     conversationService.removeApprovalPlaceholders(conversationId);
-                    adapter.sendMessage(replyTarget, "⛔ 已拒绝执行工具: " + pending.getToolName());
+                    String denyHint = "⛔ 已拒绝执行工具: " + pending.getToolName();
+                    persistAndBroadcastApprovalHint(conversationId, denyHint,
+                            "denied", pending.getPendingId(), pending.getToolName());
+                    adapter.sendMessage(replyTarget, denyHint);
                     log.info("[{}] Approval DENIED via IM command: pendingId={}, tool={}, msgRewritten={}",
                             adapter.getChannelType(), pending.getPendingId(), pending.getToolName(),
                             denyOutcome.messagesRewritten());
@@ -426,7 +558,10 @@ public class ChannelMessageRouter {
                     // Non-approval message while a pending exists → treat as implicit deny.
                     approvalService.resolve(pending.getPendingId(), message.getSenderId(), "denied");
                     conversationService.removeApprovalPlaceholders(conversationId);
-                    adapter.sendMessage(replyTarget, "⛔ 审批已取消。将继续处理您的新消息。");
+                    String cancelHint = "⛔ 审批已取消。将继续处理您的新消息。";
+                    persistAndBroadcastApprovalHint(conversationId, cancelHint,
+                            "cancelled", pending.getPendingId(), pending.getToolName());
+                    adapter.sendMessage(replyTarget, cancelHint);
                     log.info("[{}] Approval auto-cancelled (non-approval message): pendingId={}",
                             adapter.getChannelType(), pending.getPendingId());
                     // Fall through to process the new message normally.
@@ -454,11 +589,20 @@ public class ChannelMessageRouter {
             }
 
             // 保存用户消息（带 contentParts）
+            // Group sender attribution: tag the persisted content + the
+            // prompt with [@sender] in groups so the LLM can disambiguate
+            // multiple users sharing one conversation. Single chats pass
+            // through unchanged (chatId is null).
             List<MessageContentPart> parts = message.getContentParts();
-            conversationService.saveMessage(conversationId, "user", message.getContent(), parts);
+            String attributedContent = applyGroupTag(message, message.getContent());
+            conversationService.saveMessage(conversationId, "user", attributedContent, parts);
 
             // 构建 prompt（语音输入时注入场景提示词）
             String promptText = buildPromptFromParts(message.getContent(), parts, message.getInputMode());
+            // Re-apply the tag in case the prompt was assembled from
+            // non-text parts (image/file) where buildPromptFromParts
+            // ignored `content`. Idempotent: skips when already prefixed.
+            promptText = applyGroupTag(message, promptText);
 
             // 注册到 ChatStreamTracker：让 graph 节点广播的事件（phase / content_delta / tool_call_* 等）
             // 能被 ChatConsole observer 订阅到。不注册 → broadcast() 会因 state==null 短路丢弃。
@@ -511,9 +655,13 @@ public class ChannelMessageRouter {
                     // 检查 chat 过程中是否产生了审批 pending
                     PendingApproval newPending = approvalService.findPendingByConversation(conversationId);
                     if (newPending != null) {
-                        // 有审批需求：不保存 LLM 的审批占位回复到 DB，直接从 pending 元数据构建通知
-                        String approvalNotice = buildApprovalNotice(newPending);
-                        adapter.renderAndSend(replyTarget, approvalNotice);
+                        // Channel-specific approval rendering: WeCom overrides
+                        // sendApprovalNotice to post a button_interaction card;
+                        // every other adapter falls back to the markdown-text path
+                        // on AbstractChannelAdapter (preserves PR-0 behavior for
+                        // non-WeCom channels).
+                        var notice = approvalNotificationService.buildNotice(newPending);
+                        adapter.sendApprovalNotice(replyTarget, notice);
                         log.info("[{}] Approval triggered during chat, sent notice (NOT saved to DB): tool={}",
                                 adapter.getChannelType(), newPending.getToolName());
                     } else {
@@ -641,7 +789,11 @@ public class ChannelMessageRouter {
             PendingApproval newPending = approvalService.findPendingByConversation(conversationId);
             if (newPending != null) {
                 String replyTarget = resolveReplyTarget(message);
-                streamingAdapter.sendMessage(replyTarget, buildApprovalNotice(newPending));
+                // Same polymorphic dispatch as the non-streaming path — WeCom
+                // renders a card, others render text. See the buildNotice +
+                // sendApprovalNotice pair at the non-streaming call site above.
+                var notice = approvalNotificationService.buildNotice(newPending);
+                streamingAdapter.sendApprovalNotice(replyTarget, notice);
                 log.info("[{}] Approval triggered during streaming (NOT saved to DB): tool={}",
                         channelType, newPending.getToolName());
             } else if (finalContent != null && !finalContent.isBlank()) {
@@ -702,8 +854,14 @@ public class ChannelMessageRouter {
         String replyTarget = resolveReplyTarget(triggerMessage);
         Long agentId = channelEntity.getAgentId();
 
-        // 通知用户审批已通过
-        adapter.sendMessage(replyTarget, "✅ 已批准执行工具: " + consumed.getToolName());
+        // Notify the user that the approval went through. Persist + broadcast so a
+        // Web mirror of the same conversationId sees the resolution; otherwise this
+        // hint would only land in the IM channel and the Web admin console would
+        // show the replay reply with no preceding "approved" marker.
+        String approveHint = "✅ 已批准执行工具: " + consumed.getToolName();
+        persistAndBroadcastApprovalHint(conversationId, approveHint,
+                "approved", consumed.getPendingId(), consumed.getToolName());
+        adapter.sendMessage(replyTarget, approveHint);
 
         // 清理 DB 中残留的审批占位消息
         conversationService.removeApprovalPlaceholders(conversationId);
@@ -739,7 +897,62 @@ public class ChannelMessageRouter {
                     adapter.getChannelType(), consumed.getToolName(), reply.length());
         } catch (Exception e) {
             log.error("[approval-replay] Replay failed: {}", e.getMessage(), e);
-            adapter.sendMessage(replyTarget, "❌ 工具执行失败: " + e.getMessage());
+            String errHint = "❌ 工具执行失败: " + e.getMessage();
+            persistAndBroadcastApprovalHint(conversationId, errHint, null, null, null);
+            adapter.sendMessage(replyTarget, errHint);
+        }
+    }
+
+    /**
+     * Persist an approval-related hint as an assistant message and best-effort
+     * broadcast it to any live SSE viewer of the conversation.
+     * <p>
+     * Without this, IM-driven approve/deny only reaches the originating IM
+     * channel via {@code adapter.sendMessage(...)} — a Web mirror of the same
+     * conversationId has no record of the resolution because nothing lands in
+     * {@code mate_message} and no SSE event is emitted. The hint then "vanishes"
+     * from the Web admin console even though it shows up on the user's phone.
+     * <p>
+     * Persistence is the load-bearing fix (Web reload picks it up). Broadcast
+     * is best-effort: if no SSE stream is currently registered for the
+     * conversation, the broadcast no-ops silently — that's the common case
+     * since IM-driven clicks rarely race with an active web subscriber.
+     *
+     * @param conversationId conversation owning the hint
+     * @param hint           text to render as an assistant bubble
+     * @param decision       "approved" / "denied" / "cancelled" / null (skips the
+     *                       structured resolved event when null, e.g. on replay error)
+     * @param pendingId      pending approval id; null when not applicable
+     * @param toolName       tool name for the structured event; null when not applicable
+     */
+    private void persistAndBroadcastApprovalHint(String conversationId, String hint,
+                                                  String decision, String pendingId,
+                                                  String toolName) {
+        try {
+            conversationService.saveMessage(conversationId, "assistant", hint, null, "completed");
+        } catch (Exception e) {
+            log.warn("[approval-hint] saveMessage failed for conv={}: {}",
+                    conversationId, e.getMessage());
+        }
+        try {
+            if (decision != null) {
+                streamTracker.broadcastObject(conversationId, "tool_approval_resolved", Map.of(
+                        "pendingId", pendingId == null ? "" : pendingId,
+                        "decision", decision,
+                        "toolName", toolName == null ? "" : toolName,
+                        "timestamp", System.currentTimeMillis()
+                ));
+            }
+            streamTracker.broadcastObject(conversationId, "message_start",
+                    Map.of("role", "assistant"));
+            streamTracker.broadcastObject(conversationId, "content_delta",
+                    Map.of("delta", hint));
+            streamTracker.broadcastObject(conversationId, "message_complete",
+                    Map.of("status", "completed"));
+        } catch (Exception e) {
+            // Broadcast is best-effort; a missing run state is the common case.
+            log.debug("[approval-hint] broadcast skipped/failed for conv={}: {}",
+                    conversationId, e.getMessage());
         }
     }
 
@@ -776,9 +989,13 @@ public class ChannelMessageRouter {
 
         conversationService.getOrCreateConversation(conversationId, agentId, username, channelEntity.getWorkspaceId());
         List<MessageContentPart> parts = message.getContentParts();
-        conversationService.saveMessage(conversationId, "user", message.getContent(), parts);
+        // Mirror processMessage's group attribution for the streaming path
+        // (Web channel today; future streaming IM channels inherit it).
+        String attributedContent = applyGroupTag(message, message.getContent());
+        conversationService.saveMessage(conversationId, "user", attributedContent, parts);
 
         String promptText = buildPromptFromParts(message.getContent(), parts, message.getInputMode());
+        promptText = applyGroupTag(message, promptText);
         // RFC-063r §2.5: forward ChatOrigin so tools created during this
         // streaming conversation inherit channel binding.
         ChatOrigin origin = chatOriginFactory.from(
@@ -844,6 +1061,70 @@ public class ChannelMessageRouter {
     private String buildConversationId(ChannelMessage message) {
         String identifier = message.getChatId() != null ? message.getChatId() : message.getSenderId();
         return message.getChannelType() + ":" + identifier;
+    }
+
+    /**
+     * Build a sender-attribution tag for group messages. Returns
+     * {@code [@senderName]} when the message is from a multi-user channel
+     * context (chatId is set), else {@code null} for 1:1 chats.
+     *
+     * <p>Without this tag, three users asking three different questions in
+     * the same group conversation collapse into an unattributed wall of
+     * "user:" turns and the LLM can no longer tell who is asking what —
+     * it answers based on the most-recent text and ignores the rest.
+     * Single chats are unaffected because chatId is null there.
+     *
+     * <p>Prefer {@code senderName} when populated; otherwise fall back to
+     * {@code senderId}. WeCom currently sets both to the same opaque
+     * openid which is still useful for disambiguation; future channels
+     * (DingTalk, Slack) carry friendlier display names that flow through
+     * unchanged.
+     *
+     * @return sender tag like {@code [@Alice]}, or {@code null} if the
+     *         message is not from a group context.
+     */
+    static String buildGroupTag(ChannelMessage message) {
+        if (message == null) return null;
+        String chatId = message.getChatId();
+        if (chatId == null || chatId.isBlank()) return null;
+        String name = (message.getSenderName() != null && !message.getSenderName().isBlank())
+                ? message.getSenderName() : message.getSenderId();
+        if (name == null || name.isBlank()) return null;
+        return "[@" + name + "]";
+    }
+
+    /**
+     * Apply {@link #buildGroupTag} to {@code content}. Idempotent: if
+     * {@code content} already starts with the tag (e.g. an upstream
+     * adapter has pre-attributed it), returns it unchanged so we don't
+     * double-stamp. No-op for single chats.
+     */
+    static String applyGroupTag(ChannelMessage message, String content) {
+        String tag = buildGroupTag(message);
+        if (tag == null) return content;
+        // Empty content: leave empty rather than persist or prompt with a
+        // bare "[@Alice]" — the message had no payload to attribute.
+        if (content == null || content.isEmpty()) return content;
+        if (content.startsWith(tag)) return content;
+        return tag + " " + content;
+    }
+
+    /**
+     * Decision helper for the debounce merger: should an incoming message
+     * from {@code incomingSender} merge into a pending buffer started by
+     * {@code existingSender}? True only when the senders match — different
+     * senders in the same conversation (a group context) must NOT merge,
+     * else the second user's text gets attributed to the first.
+     *
+     * <p>Null-handling: a null {@code existingSender} means "no buffer to
+     * merge into" so the answer is always false; a null
+     * {@code incomingSender} (rare, but seen in test fixtures) is also
+     * not allowed to silently merge — returning false routes to the
+     * "create new pending" branch which is safe.
+     */
+    static boolean isSameSender(String existingSender, String incomingSender) {
+        if (existingSender == null || incomingSender == null) return false;
+        return existingSender.equals(incomingSender);
     }
 
     /**

@@ -5,25 +5,25 @@ INSERT INTO mate_user (id, username, password, nickname, role, enabled, create_t
 VALUES (1, 'admin', '$2a$10$7JB720yubVSZvUI0rEqK/.VqGOZTH.ulu33dHOiBE8ByOhJIrdAu2', 'MateClaw Admin', 'admin', TRUE, NOW(), NOW(), 0)
 ON DUPLICATE KEY UPDATE username=VALUES(username), password=VALUES(password), nickname=VALUES(nickname), role=VALUES(role), enabled=VALUES(enabled), update_time=VALUES(update_time), deleted=VALUES(deleted);
 
--- 默认 Agent：通用助手（ReAct 模式）
+-- 默认数字员工：通用助手（ReAct 模式）
 INSERT INTO mate_agent (id, name, description, agent_type, system_prompt, model_name, max_iterations, enabled, icon, tags, create_time, update_time, deleted)
-VALUES (1000000001, 'MateClaw Assistant', '默认 AI 助手，基于 ReAct 模式，支持工具调用', 'react',
-        '你是 MateClaw，一个智能 AI 助手。你可以帮助用户回答问题、分析数据、执行任务。请用中文回复，保持专业、友好的态度。',
+VALUES (1000000001, '通用助手', '日常问答、数据分析、工具调用都能搞定的全能助手', 'react',
+        '你是 MateClaw 的通用助手。你可以帮助用户回答问题、分析数据、调用工具完成任务。请用中文回复，保持专业、友好的态度。',
         NULL, 100, TRUE, 'pi:robot-face-happy', 'default,assistant', NOW(), NOW(), 0)
 ON DUPLICATE KEY UPDATE name=VALUES(name), description=VALUES(description), agent_type=VALUES(agent_type), system_prompt=VALUES(system_prompt), model_name=VALUES(model_name), max_iterations=VALUES(max_iterations), enabled=VALUES(enabled), icon=VALUES(icon), tags=VALUES(tags), update_time=VALUES(update_time), deleted=VALUES(deleted);
 
--- 默认 Agent：任务规划助手（Plan-Execute 模式）
+-- 默认数字员工：任务规划师（Plan-Execute 模式）
 INSERT INTO mate_agent (id, name, description, agent_type, system_prompt, model_name, max_iterations, enabled, icon, tags, create_time, update_time, deleted)
-VALUES (1000000002, 'Task Planner', '任务规划助手，适合复杂多步骤任务', 'plan_execute',
-        '你是一个专业的任务规划和执行助手。你擅长将复杂目标分解为可执行的步骤，并逐步完成。请用中文回复。',
+VALUES (1000000002, '任务规划师', '把复杂目标拆成可执行步骤，逐步推进直到完成', 'plan_execute',
+        '你是一位专业的任务规划师。你擅长将复杂目标分解为可执行的步骤，并逐步完成。请用中文回复。',
         NULL, 100, TRUE, 'pi:clipboard-note', 'planning,task', NOW(), NOW(), 0)
 ON DUPLICATE KEY UPDATE name=VALUES(name), description=VALUES(description), agent_type=VALUES(agent_type), system_prompt=VALUES(system_prompt), model_name=VALUES(model_name), max_iterations=VALUES(max_iterations), enabled=VALUES(enabled), icon=VALUES(icon), tags=VALUES(tags), update_time=VALUES(update_time), deleted=VALUES(deleted);
 
--- StateGraph ReAct Agent（支持 StateGraph 架构）
+-- 默认数字员工：推理分析师（显式推理循环 + 工具调用）
 INSERT INTO mate_agent (id, name, description, agent_type, system_prompt, model_name, max_iterations, enabled, icon, tags, create_time, update_time, deleted)
-VALUES (1000000003, 'StateGraph ReAct', '基于 StateGraph 的 ReAct Agent，支持显式推理循环和工具调用', 'react',
-        '你是基于 StateGraph 架构的智能助手。你可以使用工具来帮助用户解决问题。请用中文回复，保持专业、友好的态度。',
-        NULL, 100, TRUE, 'pi:cpu', 'react,stategraph,tools', NOW(), NOW(), 0)
+VALUES (1000000003, '推理分析师', '分步思考、推理过程清晰可见，适合需要"想清楚再回答"的问题', 'react',
+        '你是一位推理分析师，善于深度推理。面对问题时，请先分步思考、清晰呈现推理过程，再调用工具或给出答案。请用中文回复，保持专业、友好的态度。',
+        NULL, 100, TRUE, 'pi:cpu', 'react,reasoning,tools', NOW(), NOW(), 0)
 ON DUPLICATE KEY UPDATE name=VALUES(name), description=VALUES(description), agent_type=VALUES(agent_type), system_prompt=VALUES(system_prompt), model_name=VALUES(model_name), max_iterations=VALUES(max_iterations), enabled=VALUES(enabled), icon=VALUES(icon), tags=VALUES(tags), update_time=VALUES(update_time), deleted=VALUES(deleted);
 
 -- ==================== 本地模型 Provider（优先展示） ====================
@@ -48,6 +48,13 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), api_key_prefix=VALUES(api_key_prefix)
 
 INSERT INTO mate_model_provider (provider_id, name, api_key_prefix, chat_model, api_key, base_url, generate_kwargs, is_custom, is_local, support_model_discovery, support_connection_check, freeze_url, require_api_key, create_time, update_time)
 VALUES ('dashscope', 'DashScope', 'sk-', 'DashScopeChatModel', '', '', '{}', FALSE, FALSE, TRUE, TRUE, FALSE, TRUE, NOW(), NOW())
+ON DUPLICATE KEY UPDATE name=VALUES(name), api_key_prefix=VALUES(api_key_prefix), chat_model=VALUES(chat_model), api_key=VALUES(api_key), base_url=VALUES(base_url), generate_kwargs=VALUES(generate_kwargs), is_custom=VALUES(is_custom), is_local=VALUES(is_local), support_model_discovery=VALUES(support_model_discovery), support_connection_check=VALUES(support_connection_check), freeze_url=VALUES(freeze_url), require_api_key=VALUES(require_api_key), update_time=VALUES(update_time);
+
+-- DashScope OpenAI 兼容端点：与 dashscope provider 共用同一把 sk- key，但走
+-- compatible-mode/v1 路径。带点号版本号的 qwen 系列（qwen3.5-*, qwen3.6-*）只在
+-- 这里能调通——native 端点会返回 400 InvalidParameter。
+INSERT INTO mate_model_provider (provider_id, name, api_key_prefix, chat_model, api_key, base_url, generate_kwargs, is_custom, is_local, support_model_discovery, support_connection_check, freeze_url, require_api_key, create_time, update_time)
+VALUES ('dashscope-compat', 'DashScope (兼容模式)', 'sk-', 'OpenAIChatModel', '', 'https://dashscope.aliyuncs.com/compatible-mode/v1', '{}', FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, NOW(), NOW())
 ON DUPLICATE KEY UPDATE name=VALUES(name), api_key_prefix=VALUES(api_key_prefix), chat_model=VALUES(chat_model), api_key=VALUES(api_key), base_url=VALUES(base_url), generate_kwargs=VALUES(generate_kwargs), is_custom=VALUES(is_custom), is_local=VALUES(is_local), support_model_discovery=VALUES(support_model_discovery), support_connection_check=VALUES(support_connection_check), freeze_url=VALUES(freeze_url), require_api_key=VALUES(require_api_key), update_time=VALUES(update_time);
 
 INSERT INTO mate_model_provider (provider_id, name, api_key_prefix, chat_model, api_key, base_url, generate_kwargs, is_custom, is_local, support_model_discovery, support_connection_check, freeze_url, require_api_key, create_time, update_time)
@@ -198,12 +205,18 @@ VALUES
 (1000000101, 'Qwen3 Max', 'dashscope', 'qwen3-max', '', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000102, 'Qwen3 235B A22B Thinking', 'dashscope', 'qwen3-235b-a22b-thinking-2507', '', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000103, 'DeepSeek-V3.2', 'dashscope', 'deepseek-v3.2', '', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
--- 注意: qwen3-plus / qwen3.5-plus / qwen3.5-max / qwen3.6-* 等带点号的版本只在 OpenAI 兼容端点上线，
--- DashScope native（text-generation/generation）调用会返回 400 InvalidParameter，请使用 bailian-team 等 OpenAI-compat provider。
+-- 注意: qwen3-plus / qwen3.5-plus / qwen3.5-max / qwen3.6-* 等带点号的版本只在 OpenAI 兼容端点上线。
+-- DashScope native（text-generation/generation）调用会返回 400 InvalidParameter。
+-- 这些模型挂在 dashscope-compat provider 下，复用同一把 sk- key 但走 compatible-mode/v1 端点。
 (1000000173, 'Qwen Long', 'dashscope', 'qwen-long', '长文本模型，支持超长上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000174, 'Qwen Plus (latest)',  'dashscope', 'qwen-plus-latest',  '通义千问 Plus 最新稳定快照，自动跟随官方更新', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000175, 'Qwen Max (latest)',   'dashscope', 'qwen-max-latest',   '通义千问 Max 最新稳定快照，最强推理能力',     0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000176, 'Qwen Turbo (latest)', 'dashscope', 'qwen-turbo-latest', '通义千问 Turbo 最新稳定快照，低延迟、高并发', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+-- DashScope 兼容模式专属模型（点号版本号系列）—— 与 dashscope provider 共用同一把 sk- key。
+-- 仅收录在通用账号上确实可调通的 -plus 版本；-max / -vl-max 在 model market 可见但 API 返回 404。
+(1000000601, 'Qwen3.6 Plus',  'dashscope-compat', 'qwen3.6-plus',  '通义千问 3.6 Plus 旗舰，平衡推理与速度（兼容模式专属）',          0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000603, 'Qwen3.5 Plus',  'dashscope-compat', 'qwen3.5-plus',  '通义千问 3.5 Plus（兼容模式专属）',                                0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000605, 'Qwen3 VL Plus', 'dashscope-compat', 'qwen3-vl-plus', '通义千问 3 视觉理解 Plus，支持图像、视频输入（兼容模式专属）',     0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000104, 'Qwen3.5-122B-A10B', 'modelscope', 'Qwen/Qwen3.5-122B-A10B', '', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000105, 'GLM-5', 'modelscope', 'ZhipuAI/GLM-5', '', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000106, 'Qwen3.5 Plus', 'aliyun-codingplan', 'qwen3.5-plus', '', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
@@ -529,6 +542,21 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), display_name=VALUES(display_name), de
 -- 内置工具：DOCX 渲染（RFC-045 — 进程内 Apache POI，毫秒级新建 .docx）
 INSERT INTO mate_tool (id, name, display_name, description, tool_type, bean_name, icon, enabled, builtin, create_time, update_time, deleted)
 VALUES (1000000019, 'DocxRenderTool', 'DOCX 渲染', '将 Markdown 直接渲染为 .docx 并返回一次性下载链接。进程内 Apache POI 实现，无需 Node.js 子进程；支持标题、加粗、列表、表格。新建文档场景的首选工具。', 'builtin', 'docxRenderTool', '📝', TRUE, TRUE, NOW(), NOW(), 0)
+ON DUPLICATE KEY UPDATE name=VALUES(name), display_name=VALUES(display_name), description=VALUES(description), tool_type=VALUES(tool_type), bean_name=VALUES(bean_name), icon=VALUES(icon), enabled=VALUES(enabled), builtin=VALUES(builtin), update_time=VALUES(update_time), deleted=VALUES(deleted);
+
+-- 内置工具：XLSX 渲染（进程内 Apache POI，从 Markdown 表格生成多 sheet 工作簿）
+INSERT INTO mate_tool (id, name, display_name, description, tool_type, bean_name, icon, enabled, builtin, create_time, update_time, deleted)
+VALUES (1000000020, 'XlsxRenderTool', 'XLSX 渲染', '将 Markdown 直接渲染为 .xlsx 工作簿并返回一次性下载链接。进程内 Apache POI 实现；每个 # 一级标题生成一个 sheet，竖线表格成为行内容，数字单元格自动识别。', 'builtin', 'xlsxRenderTool', '📊', TRUE, TRUE, NOW(), NOW(), 0)
+ON DUPLICATE KEY UPDATE name=VALUES(name), display_name=VALUES(display_name), description=VALUES(description), tool_type=VALUES(tool_type), bean_name=VALUES(bean_name), icon=VALUES(icon), enabled=VALUES(enabled), builtin=VALUES(builtin), update_time=VALUES(update_time), deleted=VALUES(deleted);
+
+-- 内置工具：PPTX 渲染（进程内 Apache POI，Marp 风格 Markdown 生成 .pptx）
+INSERT INTO mate_tool (id, name, display_name, description, tool_type, bean_name, icon, enabled, builtin, create_time, update_time, deleted)
+VALUES (1000000021, 'PptxRenderTool', 'PPTX 渲染', '将 Marp 风格的 Markdown 直接渲染为 .pptx 演示文稿并返回一次性下载链接。进程内 Apache POI 实现；--- 分页、# / ## 作幻灯片标题、- 作要点、<!-- ... --> 作演讲者备注。', 'builtin', 'pptxRenderTool', '🎞️', TRUE, TRUE, NOW(), NOW(), 0)
+ON DUPLICATE KEY UPDATE name=VALUES(name), display_name=VALUES(display_name), description=VALUES(description), tool_type=VALUES(tool_type), bean_name=VALUES(bean_name), icon=VALUES(icon), enabled=VALUES(enabled), builtin=VALUES(builtin), update_time=VALUES(update_time), deleted=VALUES(deleted);
+
+-- 内置工具：PDF 渲染（双 backend：LibreOffice 子进程优先，进程内 OpenPDF + Flying Saucer 兜底）
+INSERT INTO mate_tool (id, name, display_name, description, tool_type, bean_name, icon, enabled, builtin, create_time, update_time, deleted)
+VALUES (1000000022, 'PdfRenderTool', 'PDF 渲染', '将 Markdown 渲染为最终交付形态的 .pdf 并返回一次性下载链接。双 backend 自动切换（优先 LibreOffice，不可用时回落到进程内 OpenPDF + Flying Saucer）；通过 YAML frontmatter 控制封面、页眉、页脚。', 'builtin', 'pdfRenderTool', '📄', TRUE, TRUE, NOW(), NOW(), 0)
 ON DUPLICATE KEY UPDATE name=VALUES(name), display_name=VALUES(display_name), description=VALUES(description), tool_type=VALUES(tool_type), bean_name=VALUES(bean_name), icon=VALUES(icon), enabled=VALUES(enabled), builtin=VALUES(builtin), update_time=VALUES(update_time), deleted=VALUES(deleted);
 
 -- 示例 MCP Server：Filesystem（参考 MateClaw 文档中的 mcpServers.filesystem）

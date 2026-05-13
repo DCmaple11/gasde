@@ -221,6 +221,37 @@
           <p class="evidence-card__description">{{ $t('chat.evidenceDescription') }}</p>
         </div>
 
+        <!--
+          feedback_event card: recovery affordances for turns that ended
+          in a non-transient error. Backend's NodeStreamingChatHelper
+          handles transient TLS / IO retries silently; this card only
+          appears for the residue (auth, billing, model-not-found, raw
+          parse failures, etc.) that no amount of retry can fix without
+          user input. Buttons are data-driven from the event's `actions`
+          array so the backend can narrow the offering per error type
+          without a frontend release.
+        -->
+        <div v-if="feedbackInfo" class="feedback-card">
+          <div class="feedback-card__header">
+            <el-icon class="feedback-card__icon"><WarningFilled /></el-icon>
+            <span class="feedback-card__title">{{ $t('chat.feedback.title') }}</span>
+          </div>
+          <p class="feedback-card__description">{{ $t('chat.feedback.description') }}</p>
+          <div class="feedback-card__actions">
+            <button
+              v-for="action in feedbackInfo.actions"
+              :key="action"
+              class="feedback-card__btn"
+              :class="`feedback-card__btn--${action}`"
+              type="button"
+              @click="handleFeedbackAction(action)"
+            >
+              <el-icon v-if="action === 'retry' || action === 'regenerate'"><RefreshRight /></el-icon>
+              {{ feedbackActionLabel(action) }}
+            </button>
+          </div>
+        </div>
+
         <!-- 附件列表 -->
         <div v-if="attachments?.length" class="message-attachments">
           <div
@@ -337,6 +368,18 @@
           >
             <el-icon><RefreshRight /></el-icon>
           </button>
+          <!-- Reply model attribution (assistant only) -->
+          <span
+            v-if="role === 'assistant' && replyModel"
+            class="action-model"
+            :title="replyModelTitle"
+          >{{ replyModel }}</span>
+          <!-- Multimodal sidecar routing badge (assistant only, when sidecar fired) -->
+          <span
+            v-if="role === 'assistant' && routingBadge"
+            class="action-routing"
+            :title="routingBadge.tooltip"
+          >🔀 {{ routingBadge.label }}</span>
           <!-- 时间戳（inline） -->
           <span class="action-time">{{ formattedTime }}</span>
         </div>
@@ -347,6 +390,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { ElMessage } from 'element-plus'
 import {
   ArrowDown,
   CloseBold,
@@ -366,6 +410,7 @@ import { useMarkdownRenderer } from '@/composables/useMarkdownRenderer'
 import { useAuthenticatedAttachment } from '@/composables/useAuthenticatedAttachment'
 import { useToolLabel } from '@/composables/useToolLabel'
 import { http } from '@/api'
+import { copyToClipboard } from '@/utils/clipboard'
 import TypingCursor from './TypingCursor.vue'
 import BrowserTimeline from './BrowserTimeline.vue'
 import ToolCallSegment from './ToolCallSegment.vue'
@@ -378,7 +423,7 @@ import type { Message, MessageSegment, ChatAttachment, ToolCallMeta, PlanMeta } 
 import type { ChatErrorInfo } from '@/types/chatError'
 
 const { renderMarkdown } = useMarkdownRenderer()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const { getToolLabel } = useToolLabel()
 const { blobUrls, loadAllImages, loadAllVideos, loadAllAudios, loadAllModels, downloadFile, openImage, getDisplayUrl, revokeAll } = useAuthenticatedAttachment()
 
@@ -563,7 +608,7 @@ let copyTimer: ReturnType<typeof setTimeout> | null = null
 function copyMessage() {
   const text = displayContent.value || props.message.content || ''
   if (!text) return
-  navigator.clipboard.writeText(text).then(() => {
+  copyToClipboard(text).then(() => {
     copyState.value = 'copied'
     if (copyTimer) clearTimeout(copyTimer)
     copyTimer = setTimeout(() => { copyState.value = 'idle' }, 2000)
@@ -702,11 +747,76 @@ watch(model3dAttachments, (atts) => {
 
 // --- 时间 ---
 const formattedTime = computed(() => {
-  if (!props.message.createTime) return ''
-  return new Date(props.message.createTime).toLocaleTimeString('zh-CN', {
+  const createTime = props.message.createTime
+  if (!createTime) return ''
+
+  const date = new Date(createTime)
+  if (Number.isNaN(date.getTime())) return ''
+
+  const now = new Date()
+
+  const sameDay = (a: Date, b: Date) =>
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+
+  const currentLocale = locale.value
+
+  const time = date.toLocaleTimeString(currentLocale, {
     hour: '2-digit',
     minute: '2-digit',
   })
+
+  if (sameDay(date, now)) return time
+
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+
+  if (sameDay(date, yesterday)) {
+    return `${t('security.activity.yesterday')} ${time}`
+  }
+
+  return date.toLocaleString(currentLocale, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+})
+
+// Reply model attribution: shows which model produced the assistant message.
+// Empty for streaming (server only emits runtimeModel after persistence) and
+// historical messages prior to MessageVO carrying the field.
+const replyModel = computed(() => props.message.runtimeModel || '')
+const replyModelTitle = computed(() => {
+  const provider = props.message.runtimeProvider
+  const base = t('chat.replyModel', { model: replyModel.value })
+  return provider ? `${base} (${provider})` : base
+})
+
+// Multimodal routing badge: rendered only when a sidecar actually fired this
+// turn (strategy=sidecar, sidecarModel populated). Skipped for the legacy
+// "primary handled it natively" case so non-routed turns stay clean.
+const routingBadge = computed(() => {
+  const r = props.message.metadata?.routing
+  if (!r || r.strategy !== 'sidecar' || !r.sidecarModel) return null
+  // Count routed attachments by required modality. We summarize as "1 image"
+  // / "2 images" rather than naming each file to keep the chip compact.
+  const required = r.requiredModalities || []
+  const kind = required.includes('VISION')
+    ? t('chat.routing.kind.image')
+    : required.includes('VIDEO')
+      ? t('chat.routing.kind.video')
+      : t('chat.routing.kind.media')
+  const label = `${r.sidecarModel} (${kind})`
+  const tooltip = t('chat.routing.tooltip', {
+    primary: replyModel.value || '?',
+    sidecar: r.sidecarModel,
+    sidecarProvider: r.sidecarProvider || '',
+    kind,
+  })
+  return { label, tooltip }
 })
 
 const formatFileSize = (size: number) => {
@@ -879,6 +989,66 @@ const isEvidenceInsufficient = computed<boolean>(() => {
   if (props.message.role !== 'assistant') return false
   return parsedMetadata.value?.finishReason === 'evidence_insufficient'
 })
+
+/**
+ * Recovery-affordance payload from the graph's feedback_event. Populated
+ * for assistant turns that ended in a non-transient error (after the
+ * helper's TLS / IO retry loop has already given up). Shape mirrors
+ * GraphEventPublisher.feedback: { errorType, errorMessage, actions }.
+ *
+ * <p>Surfaces a card with buttons for each action: "retry" and
+ * "regenerate" both replay the last user message; "report" copies the
+ * error details for a bug report. The card sits right under the red
+ * "[错误] …" content so users see the recovery options inline rather
+ * than having to retype the whole prompt.
+ */
+interface FeedbackInfo {
+  errorType: string
+  errorMessage: string
+  actions: string[]
+  timestamp?: number
+}
+const feedbackInfo = computed<FeedbackInfo | undefined>(() => {
+  if (props.message.role !== 'assistant') return undefined
+  const raw = parsedMetadata.value?.feedbackEvent as FeedbackInfo | undefined
+  if (!raw || !Array.isArray(raw.actions) || raw.actions.length === 0) return undefined
+  return raw
+})
+
+function handleFeedbackAction(action: string) {
+  if (action === 'retry' || action === 'regenerate') {
+    emit('regenerate')
+    return
+  }
+  if (action === 'report') {
+    // Copy error details for a bug report. Lower-friction than a modal
+    // and works offline; users paste the result into wherever they file
+    // issues. Uses the clipboard helper with execCommand fallback for
+    // non-HTTPS contexts (e.g. internal IPs without TLS).
+    const lines = [
+      `Error type: ${feedbackInfo.value?.errorType || 'UNKNOWN'}`,
+      `Message: ${feedbackInfo.value?.errorMessage || ''}`,
+      `Conversation: ${(props.message as any).conversationId || ''}`,
+      `Message id: ${(props.message as any).id || ''}`,
+      `Timestamp: ${new Date(feedbackInfo.value?.timestamp || Date.now()).toISOString()}`,
+    ].join('\n')
+    copyToClipboard(lines).then(() => {
+      ElMessage.success(t('chat.feedback.reportCopied'))
+    }).catch(() => {
+      console.error('[feedback_event] copy failed:\n' + lines)
+      ElMessage.error(t('chat.feedback.reportFailed'))
+    })
+  }
+}
+
+function feedbackActionLabel(action: string): string {
+  // Action labels go through i18n so the same data-driven button list
+  // renders correctly in zh-CN / en-US. Falls back to the raw action
+  // key if a future backend introduces a label we haven't translated.
+  const key = `chat.feedback.${action}`
+  const localized = t(key)
+  return localized === key ? action : localized
+}
 
 const browserActionsMeta = computed<BrowserAction[]>(() => {
   return parsedMetadata.value?.browserActions || []
@@ -1474,6 +1644,31 @@ watch(isGenerating, (generating) => {
   user-select: none;
 }
 
+.action-model {
+  font-size: 11px;
+  color: var(--mc-text-secondary, #64748b);
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--mc-fill-2, rgba(100, 116, 139, 0.08));
+  font-family: var(--mc-mono-font, ui-monospace, "SF Mono", Menlo, monospace);
+  user-select: text;
+  white-space: nowrap;
+}
+
+.action-routing {
+  font-size: 11px;
+  color: var(--mc-primary, #d96d46);
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--mc-primary-bg, rgba(217, 109, 70, 0.1));
+  font-family: var(--mc-mono-font, ui-monospace, "SF Mono", Menlo, monospace);
+  user-select: text;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
 /* ==================== 主内容区域 ==================== */
 .msg-content {
   position: relative;
@@ -1667,6 +1862,84 @@ watch(isGenerating, (generating) => {
   color: var(--mc-text-primary);
   font-size: 12.5px;
   opacity: 0.85;
+}
+
+/* ==================== feedback_event recovery card (ERROR_FALLBACK) ==================== */
+.feedback-card {
+  margin-top: 8px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--mc-danger, #dc2626) 8%, var(--mc-bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--mc-danger, #dc2626) 30%, transparent);
+  font-size: 13px;
+  max-width: 480px;
+  line-height: 1.5;
+}
+
+.feedback-card__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.feedback-card__icon {
+  flex-shrink: 0;
+  color: var(--mc-danger, #dc2626);
+}
+
+.feedback-card__title {
+  font-weight: 600;
+  color: var(--mc-danger, #dc2626);
+  font-size: 14px;
+}
+
+.feedback-card__description {
+  margin: 4px 0 8px;
+  color: var(--mc-text-primary);
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.feedback-card__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.feedback-card__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--mc-danger, #dc2626) 35%, transparent);
+  background: color-mix(in srgb, var(--mc-danger, #dc2626) 10%, var(--mc-bg-elevated));
+  color: var(--mc-danger, #dc2626);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.feedback-card__btn:hover {
+  background: color-mix(in srgb, var(--mc-danger, #dc2626) 18%, var(--mc-bg-elevated));
+  border-color: color-mix(in srgb, var(--mc-danger, #dc2626) 55%, transparent);
+}
+
+/* Report button is secondary action — muted neutral palette so the
+   primary "retry" stays visually emphasized. */
+.feedback-card__btn--report {
+  border-color: var(--mc-border);
+  background: var(--mc-bg-elevated);
+  color: var(--mc-text-secondary);
+}
+
+.feedback-card__btn--report:hover {
+  background: var(--mc-bg-sunken);
+  border-color: var(--mc-border-strong, var(--mc-border));
+  color: var(--mc-text-primary);
 }
 
 /* ==================== 附件 ==================== */
@@ -1957,25 +2230,125 @@ watch(isGenerating, (generating) => {
 /* ===== Mermaid block ===== */
 .markdown-body :deep(.mermaid-block) {
   margin: 14px 0;
-  padding: 16px;
   border-radius: 12px;
   background: var(--mc-mermaid-bg, #f8fafc);
   border: 1px solid var(--mc-mermaid-border, #e2e8f0);
+  overflow: hidden;
+}
+.markdown-body :deep(.mermaid-block__header) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 38px;
+  padding: 0 14px;
+  background: var(--mc-code-header-bg);
+  border-bottom: 1px solid var(--mc-mermaid-border, #e2e8f0);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--mc-code-lang-color);
+  /* Prevent the header label/buttons from being swept into a text selection
+     that starts in the surrounding markdown — the highlighted-grey selection
+     band would otherwise extend across the whole header row. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+.markdown-body :deep(.mermaid-block__lang) {
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.markdown-body :deep(.mermaid-block__actions) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.markdown-body :deep(.mermaid-block__download) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--mc-code-copy-color);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.markdown-body :deep(.mermaid-block__download:hover) {
+  background: var(--mc-code-copy-hover-bg);
+  color: var(--mc-code-copy-hover-color);
+}
+/* Pin EVERY icon inside the header to 14×14. Without this, DOMPurify can
+   normalise away the `width="14" height="14"` attrs from the markdown HTML,
+   leaving the SVG to fall back to the UA default 300×150. The button is
+   inline-flex so it grows to fit the icon, and `:hover` then paints a
+   gigantic grey rectangle (which is what user issue #67's follow-up screen-
+   shot showed). Same defence-in-depth as `.code-block__header svg`. */
+.markdown-body :deep(.mermaid-block__header svg) {
+  width: 14px !important;
+  height: 14px !important;
+  flex-shrink: 0;
+  display: inline-block;
+  vertical-align: middle;
+}
+.markdown-body :deep(.mermaid-block__header > *) {
+  flex-shrink: 0;
+  min-width: 0;
+}
+.markdown-body :deep(.mermaid-block__body) {
+  padding: 16px;
   text-align: center;
   overflow-x: auto;
+  /* Reserve a stable height so the box doesn't collapse to 0px before the
+     SVG paints — keeps layout stable across the streaming cache-miss →
+     render cycle. */
+  min-height: 96px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
-.markdown-body :deep(.mermaid-block svg) {
+.markdown-body :deep(.mermaid-block__body svg) {
   max-width: 100%;
   height: auto;
 }
-.markdown-body :deep(.mermaid-block.mermaid-error) {
+.markdown-body :deep(.mermaid-block.mermaid-error .mermaid-block__body) {
   background: #fef2f2;
-  border-color: #fecaca;
   color: #b91c1c;
   text-align: left;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   white-space: pre-wrap;
+  display: block;
+}
+/* Streaming placeholder: three pulsing dots inside the empty body. The dots
+   render the same DOM string on every v-html update (stable innerHTML) so
+   the box stops "shaking" during streaming. Once the async render fires
+   after stream end, this gets replaced with the actual SVG. */
+.markdown-body :deep(.mermaid-block__loader) {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.markdown-body :deep(.mermaid-block__loader-dot) {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--mc-mermaid-border, #cbd5e1);
+  animation: mc-mermaid-pulse 1.4s ease-in-out infinite;
+}
+.markdown-body :deep(.mermaid-block__loader-dot:nth-child(2)) {
+  animation-delay: 0.2s;
+}
+.markdown-body :deep(.mermaid-block__loader-dot:nth-child(3)) {
+  animation-delay: 0.4s;
+}
+@keyframes mc-mermaid-pulse {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.85); }
+  40% { opacity: 1; transform: scale(1); }
+}
+.markdown-body :deep(.mermaid-block__download.is-flash) {
+  background: var(--mc-warning-bg, rgba(255, 159, 67, 0.15));
+  color: var(--mc-warning, #f59e0b);
 }
 
 /* ===== KaTeX inline / block ===== */

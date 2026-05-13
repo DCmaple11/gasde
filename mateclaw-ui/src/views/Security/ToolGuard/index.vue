@@ -146,16 +146,21 @@
           <div class="modal-body">
             <div class="form-grid">
               <div class="form-group" v-if="!editingRule">
-                <label>{{ t('security.toolGuard.fields.ruleId') }}</label>
-                <input v-model="ruleForm.ruleId" class="form-input" placeholder="CUSTOM_RULE_001" />
+                <label>{{ t('security.toolGuard.fields.ruleId') }} <span class="required">*</span></label>
+                <input
+                  v-model.trim="ruleForm.ruleId"
+                  class="form-input"
+                  placeholder="CUSTOM_RULE_001"
+                  required
+                />
               </div>
               <div class="form-group">
-                <label>{{ t('security.toolGuard.fields.name') }}</label>
-                <input v-model="ruleForm.name" class="form-input" />
+                <label>{{ t('security.toolGuard.fields.name') }} <span class="required">*</span></label>
+                <input v-model="ruleForm.name" class="form-input" required />
               </div>
               <div class="form-group">
-                <label>{{ t('security.toolGuard.fields.pattern') }}</label>
-                <input v-model="ruleForm.pattern" class="form-input mono" placeholder="regex pattern" />
+                <label>{{ t('security.toolGuard.fields.pattern') }} <span class="required">*</span></label>
+                <input v-model="ruleForm.pattern" class="form-input mono" placeholder="regex pattern" required />
               </div>
               <div class="form-group">
                 <label>{{ t('security.toolGuard.fields.severity') }}</label>
@@ -215,6 +220,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { ElMessage } from 'element-plus'
 import { securityApi } from '@/api'
 import { parseJsonArray } from '../composables/helpers'
 import type { GuardRule } from '@/types'
@@ -350,6 +356,19 @@ function openEditRuleModal(rule: GuardRule) {
 }
 
 async function saveRule() {
+  if (!editingRule.value && !ruleForm.ruleId.trim()) {
+    ElMessage.error(t('security.toolGuard.messages.ruleIdRequired'))
+    return
+  }
+  if (!ruleForm.name.trim()) {
+    ElMessage.error(t('security.toolGuard.messages.nameRequired'))
+    return
+  }
+  if (!ruleForm.pattern.trim()) {
+    ElMessage.error(t('security.toolGuard.messages.patternRequired'))
+    return
+  }
+
   try {
     if (editingRule.value) {
       await securityApi.updateRule(editingRule.value.ruleId, ruleForm)
@@ -358,8 +377,13 @@ async function saveRule() {
     }
     showRuleModal.value = false
     loadRules()
-  } catch {
-    // ignore
+  } catch (e: any) {
+    const raw = e?.msg || e?.message || ''
+    if (typeof raw === 'string' && raw.toLowerCase().includes('already exists')) {
+      ElMessage.error(t('security.toolGuard.messages.ruleIdDuplicate'))
+    } else {
+      ElMessage.error(raw || t('security.toolGuard.messages.saveFailed'))
+    }
   }
 }
 
@@ -398,6 +422,7 @@ onMounted(async () => {
 .subsection-title { font-size: 16px; font-weight: 600; color: var(--mc-text-primary); margin: 0 0 12px; }
 
 .rule-name { font-weight: 500; }
+.required { color: var(--mc-danger, #ef4444); }
 .rule-pattern {
   font-family: 'SF Mono', 'Fira Code', monospace;
   font-size: 11px;

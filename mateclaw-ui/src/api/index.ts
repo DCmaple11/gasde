@@ -53,7 +53,15 @@ http.interceptors.response.use(
     if (err.response?.status === 401) {
       handleAuthFailure()
     }
-    return Promise.reject(err.response?.data?.msg || err.message)
+    // Wrap as Error so consumers can read e.message uniformly, but preserve
+    // err.response so callers needing the structured payload (e.g. workflow
+    // compile errors → response.data.data.errors[]) can still reach it.
+    // The previous shape rejected with a bare string, which silently
+    // stripped the body and made 422-class errors look like "no response"
+    // on the publish/compile flows.
+    const wrapped = new Error(err.response?.data?.msg || err.message || 'Request failed')
+    ;(wrapped as Error & { response?: unknown }).response = err.response
+    return Promise.reject(wrapped)
   }
 )
 
@@ -85,7 +93,12 @@ export const authApi = {
 
 // ==================== Agent ====================
 export const agentApi = {
-  list: () => http.get('/agents'),
+  /**
+   * @param params.enabled when `true`, restricts the result to enabled agents
+   *   (used by chat selectors so disabled agents disappear from the picker).
+   *   Omit to receive enabled + disabled (admin management page).
+   */
+  list: (params?: { enabled?: boolean }) => http.get('/agents', { params }),
   get: (id: string | number) => http.get(`/agents/${id}`),
   create: (data: any) => http.post('/agents', data),
   update: (id: string | number, data: any) => http.put(`/agents/${id}`, data),
@@ -93,6 +106,8 @@ export const agentApi = {
   chat: (id: string | number, data: any) => http.post(`/agents/${id}/chat`, data),
   execute: (id: string | number, data: any) => http.post(`/agents/${id}/execute`, data),
   getState: (id: string | number) => http.get(`/agents/${id}/state`),
+  /** Lightweight capability snapshot used by the chat console attachment hint. */
+  getCapabilities: (id: string | number) => http.get(`/agents/${id}/capabilities`),
 }
 
 // ==================== Templates ====================
@@ -188,6 +203,24 @@ export const skillApi = {
   getLessons: (id: string | number) => http.get(`/skills/${id}/lessons`),
   clearLessons: (id: string | number) => http.post(`/skills/${id}/lessons/clear`),
   employees: (id: string | number) => http.get(`/skills/${id}/employees`),
+  /**
+   * Per-skill secrets — env-var-shaped key/value pairs that get injected
+   * into the script subprocess at runtime. Plaintext values never leave
+   * the server; list returns masked previews only.
+   */
+  listSecrets: (id: string | number) => http.get(`/skills/${id}/secrets`),
+  putSecret: (id: string | number, key: string, value: string) =>
+    http.post(`/skills/${id}/secrets`, { key, value }),
+  deleteSecret: (id: string | number, key: string) =>
+    http.delete(`/skills/${id}/secrets/${encodeURIComponent(key)}`),
+}
+
+/** Shape returned by GET /skills/{id}/secrets. */
+export interface SkillSecretSummary {
+  key: string
+  /** Masked preview, e.g. "abc...xyz". Plaintext is never shipped. */
+  preview: string
+  updatedAt: string
 }
 
 // ==================== Activity Feed (RFC-090 §4.5) ====================
@@ -318,6 +351,12 @@ export const datasourceApi = {
 export const toolApi = {
   list: () => http.get('/tools'),
   listEnabled: () => http.get('/tools/enabled'),
+  /**
+   * Unified picker source for the agent edit tool tab — returns built-in
+   * tools plus every MCP-discovered tool grouped by server. The `name`
+   * field is what gets saved into mate_agent_tool.tool_name.
+   */
+  listAvailable: () => http.get('/tools/available'),
   get: (id: string | number) => http.get(`/tools/${id}`),
   create: (data: any) => http.post('/tools', data),
   update: (id: string | number, data: any) => http.put(`/tools/${id}`, data),
@@ -430,8 +469,8 @@ export const modelApi = {
   disableProvider: (providerId: string) => http.post(`/models/${providerId}/disable`),
 
   // ==================== Embedding Model (RFC Embedding UI) ====================
-  listByType: (modelType: 'chat' | 'embedding') =>
-    http.get('/models/by-type', { params: { modelType } }),
+  listByType: (modelType: 'chat' | 'embedding', modality?: 'vision' | 'video' | 'audio') =>
+    http.get('/models/by-type', { params: { modelType, modality } }),
   testEmbedding: (modelId: string | number) =>
     http.post(`/models/embedding/${modelId}/test`),
   getDefaultEmbedding: () => http.get('/models/embedding/default'),
@@ -502,6 +541,13 @@ export const settingsApi = {
   update: (data: any) => http.put('/settings', data),
   getLanguage: () => http.get('/settings/language'),
   updateLanguage: (language: string) => http.put('/settings/language', { language }),
+  // Dedicated endpoint for the multimodal sidecar configuration. The bulk
+  // /settings PUT now guards vision/video model ids with non-null checks so
+  // unrelated settings pages can't clobber them via partial payloads. This
+  // endpoint is the only path that writes those fields unconditionally —
+  // pass {defaultVisionModelId: null} here to explicitly clear a sidecar.
+  updateSidecar: (data: { defaultVisionModelId: number | null; defaultVideoModelId: number | null }) =>
+    http.put('/settings/sidecar', data),
 }
 
 // ==================== Workspace ====================
@@ -596,6 +642,8 @@ export const wikiApi = {
     http.delete(`/wiki/knowledge-bases/${kbId}/raw/${rawId}`),
   reprocessRaw: (kbId: number, rawId: number) =>
     http.post(`/wiki/knowledge-bases/${kbId}/raw/${rawId}/reprocess`),
+  cancelRaw: (kbId: number, rawId: number) =>
+    http.post(`/wiki/knowledge-bases/${kbId}/raw/${rawId}/cancel`),
   downloadRaw: (kbId: number, rawId: number) =>
     http.get<Blob>(`/wiki/knowledge-bases/${kbId}/raw/${rawId}/download`, {
       responseType: 'blob',
@@ -650,6 +698,56 @@ export const wikiApi = {
   // RFC-032: Search preview
   searchPreview: (kbId: number, data: { query: string; mode?: string; topK?: number }) =>
     http.post(`/wiki/kb/${kbId}/search-preview`, data),
+
+  // Transformations: reusable prompt templates run over raw materials
+  listTransformations: (kbId?: number) =>
+    http.get('/wiki/transformations', kbId != null ? { params: { kbId } } : undefined),
+  getTransformation: (id: number) =>
+    http.get(`/wiki/transformations/${id}`),
+  createTransformation: (data: {
+    kbId?: number | null
+    name: string
+    title: string
+    description?: string
+    promptTemplate: string
+    applyDefault?: boolean
+    enabled?: boolean
+    modelId?: number | null
+    outputTarget?: 'none' | 'page'
+    outputFormat?: 'markdown' | 'json'
+    outputSchema?: string | null
+  }) =>
+    http.post('/wiki/transformations', data),
+  updateTransformation: (id: number, data: {
+    title?: string
+    description?: string
+    promptTemplate?: string
+    applyDefault?: boolean
+    enabled?: boolean
+    modelId?: number | null
+    outputTarget?: 'none' | 'page'
+    outputFormat?: 'markdown' | 'json'
+    outputSchema?: string | null
+  }) =>
+    http.put(`/wiki/transformations/${id}`, data),
+  deleteTransformation: (id: number) =>
+    http.delete(`/wiki/transformations/${id}`),
+  applyTransformation: (id: number, rawId: number, sync = true) =>
+    http.post(`/wiki/transformations/${id}/apply`, { rawId }, { params: { sync } }),
+  applyTransformationToPage: (id: number, pageId: number, sync = true) =>
+    http.post(`/wiki/transformations/${id}/apply`, { pageId }, { params: { sync } }),
+  aggregateTransformation: (id: number, kbId: number) =>
+    http.post(`/wiki/transformations/${id}/aggregate`, undefined, { params: { kbId } }),
+  listTransformationRuns: (params: { rawId?: number; kbId?: number; transformationId?: number; limit?: number }) =>
+    http.get('/wiki/transformations/runs', { params }),
+  getTransformationRun: (runId: number) =>
+    http.get(`/wiki/transformations/runs/${runId}`),
+  deleteTransformationRun: (runId: number) =>
+    http.delete(`/wiki/transformations/runs/${runId}`),
+  saveTransformationRunAsPage: (runId: number) =>
+    http.post(`/wiki/transformations/runs/${runId}/save-as-page`),
+  cancelTransformationRun: (runId: number) =>
+    http.post(`/wiki/transformations/runs/${runId}/cancel`),
 }
 
 // ==================== Workspace (Team) ====================
@@ -759,4 +857,212 @@ export const hotCacheApi = {
   get: (kbId: number) => http.get<WikiHotCache | null>(`/wiki/hot-cache/${kbId}`),
   regenerate: (kbId: number) => http.post(`/wiki/hot-cache/${kbId}/regenerate`),
   reset: (kbId: number) => http.delete(`/wiki/hot-cache/${kbId}`),
+}
+
+// ==================== Workflow ====================
+
+export interface WorkflowSummary {
+  id: number
+  workspaceId: number
+  name: string
+  description?: string
+  enabled: boolean
+  draftJson?: string
+  draftUpdatedAt?: string
+  latestRevisionId?: number
+  createTime: string
+  updateTime: string
+}
+
+export interface WorkflowCompileError {
+  code: string
+  path: string
+  message: string
+}
+
+export interface WorkflowCompileFailure {
+  errorCount: number
+  errors: WorkflowCompileError[]
+}
+
+export interface WorkflowRun {
+  id: number
+  workflowId: number
+  revisionId: number
+  workspaceId: number
+  state: string
+  triggeredBy?: string
+  initialInputRef?: string
+  finalOutputRef?: string
+  errorMessage?: string
+  startedAt?: string
+  completedAt?: string
+}
+
+export interface WorkflowRunStep {
+  id: number
+  runId: number
+  stepIndex: number
+  iterationIndex?: number
+  stepName?: string
+  state: string
+  outputRef?: string
+  outputSummary?: string
+  outputContentType?: string
+  errorMessage?: string
+  durationMs?: number
+  startedAt?: string
+  completedAt?: string
+}
+
+/** Pause record carried inline on a paused run so the UI can resume
+ *  without a second roundtrip. Mirrors mate_workflow_run_pause. */
+export interface WorkflowRunPause {
+  id: number
+  runId: number
+  stepId?: number
+  pauseKind: string
+  pauseToken: string
+  externalApprovalId?: number
+  pausedAt: string
+  resumeDeadline?: string
+  resumePayloadRef?: string
+  resumedAt?: string
+  resumeOutcome?: string
+}
+
+export interface PausedRunSummary {
+  run: WorkflowRun
+  pause: WorkflowRunPause | null
+}
+
+export interface RunDetail {
+  run: WorkflowRun
+  steps: WorkflowRunStep[]
+  /** Most recent unresolved pause record; null when the run is not paused. */
+  activePause: WorkflowRunPause | null
+}
+
+export type ResumeOutcome = 'approved' | 'rejected' | 'timeout' | 'cancelled'
+
+export interface ResumeResponse {
+  kind: string
+  runId?: number | null
+  errorMessage?: string | null
+}
+
+export const workflowApi = {
+  list: (workspaceId: number) =>
+    http.get<WorkflowSummary[]>('/workflows', { params: { workspaceId } }),
+  get: (id: number) => http.get<WorkflowSummary>(`/workflows/${id}`),
+  create: (data: Partial<WorkflowSummary>) =>
+    http.post<WorkflowSummary>('/workflows', data),
+  update: (id: number, data: Partial<WorkflowSummary>) =>
+    http.put<WorkflowSummary>(`/workflows/${id}`, data),
+  delete: (id: number) => http.delete(`/workflows/${id}`),
+  saveDraft: (id: number, draftJson: string, userId?: number) =>
+    http.put(`/workflows/${id}/draft`, { draftJson }, { params: userId ? { userId } : {} }),
+  compile: (id: number) => http.post(`/workflows/${id}/compile`),
+  publish: (id: number, note?: string, userId?: number) =>
+    http.post(`/workflows/${id}/publish`,
+      note ? { note } : {},
+      { params: userId ? { userId } : {} }),
+  runs: (id: number, limit = 50) =>
+    http.get<WorkflowRun[]>(`/workflows/${id}/runs`, { params: { limit } }),
+  runDetail: (runId: number) =>
+    http.get<RunDetail>(`/workflows/runs/${runId}`),
+  /** List paused runs across the workspace so operators can resume them. */
+  listPausedRuns: (limit = 50) =>
+    http.get<PausedRunSummary[]>('/workflows/runs/paused', { params: { limit } }),
+  /** Resume a paused workflow run with one of the four documented outcomes. */
+  resumeRun: (runId: number, pauseToken: string, outcome: ResumeOutcome, payload?: string) =>
+    http.post<ResumeResponse>(`/workflows/runs/${runId}/resume`, {
+      pauseToken,
+      outcome,
+      payload,
+    }),
+  /** Generate a workflow draft from natural language. Returns the parsed
+   *  shape; the caller is responsible for creating a workflow row +
+   *  saving the draft if the user accepts it. */
+  generateDraft: (description: string) =>
+    http.post<GeneratedDraft>('/workflows/draft/generate', { description }),
+  /** Canonical workflow templates the generator can apply directly. */
+  listDraftTemplates: () =>
+    http.get<WorkflowDraftTemplate[]>('/workflows/draft/templates'),
+  /** Compile arbitrary draft JSON without persisting. Used by the template
+   *  picker / generator-result preview to give the operator the same compile
+   *  signal the existing /workflows/{id}/compile endpoint provides for saved
+   *  workflows. Resolves on success; rejects with an axios error whose
+   *  response.data.data carries the WorkflowCompileFailure on a 422. */
+  previewCompileDraft: (draftJson: string) =>
+    http.post('/workflows/draft/preview-compile', { draftJson }),
+}
+
+export interface GeneratedDraft {
+  name: string
+  description: string
+  draftJson: string
+  triggerDrafts: Array<Record<string, unknown>>
+  warnings: string[]
+  missingFields: string[]
+  confidence?: number | null
+  compileOk: boolean
+  compileErrors: WorkflowCompileError[]
+}
+
+export interface WorkflowDraftTemplate {
+  id: string
+  label: string
+  description: string
+  matchHints: string[]
+  draftJson: string
+  triggerDraftsJson: string
+}
+
+// ==================== Trigger ====================
+
+export interface TriggerSummary {
+  id: number
+  workspaceId: number
+  name?: string
+  patternType: string
+  patternJson: string
+  targetType: string
+  targetId: number
+  payloadTemplate?: string
+  rateLimitPerMin: number
+  dedupWindowSecs: number
+  botSelfFilter: boolean
+  enabled: boolean
+  fireCount: number
+  maxFires: number
+  lastFiredAt?: string
+  /** Stamp of the last dispatch attempt regardless of outcome (FIRED /
+   *  SKIPPED / FAILED). Distinguishes "never attempted" from
+   *  "attempted but the pre-flight skipped". */
+  lastDispatchedAt?: string
+  /** Most recent dispatch outcome message; null when the last attempt
+   *  fired cleanly. */
+  lastError?: string
+  patternVersion: number
+  createTime: string
+  updateTime: string
+}
+
+export const triggerApi = {
+  list: (workspaceId: number) =>
+    http.get<TriggerSummary[]>('/triggers', { params: { workspaceId } }),
+  get: (id: number) => http.get<TriggerSummary>(`/triggers/${id}`),
+  create: (data: Partial<TriggerSummary>) =>
+    http.post<TriggerSummary>('/triggers', data),
+  update: (id: number, data: Partial<TriggerSummary>) =>
+    http.put<TriggerSummary>(`/triggers/${id}`, data),
+  delete: (id: number) => http.delete(`/triggers/${id}`),
+  ingestEvent: (envelope: {
+    workspaceId: number
+    patternType: string
+    eventId?: string
+    senderId?: string
+    data?: Record<string, unknown>
+  }) => http.post('/triggers/events', envelope),
 }

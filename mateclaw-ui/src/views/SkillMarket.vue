@@ -98,10 +98,25 @@
                 <!-- RFC-042 §2.2.4 — slug under display name when they differ -->
                 <div v-if="hasI18nName(skill)" class="skill-slug">{{ skill.name }}</div>
               </div>
-              <label class="toggle-switch" @click.stop>
+              <!-- Issue #83: virtual MCP/ACP skills are view-only mirrors of the
+                   underlying MCP/ACP server row, with no mate_skill row to flip.
+                   Hiding the toggle here matches how the configure / delete
+                   buttons are gated below; users enable/disable from the
+                   Settings ▸ MCP connection page instead. -->
+              <label v-if="!isSkillRowVirtual(skill)" class="toggle-switch" @click.stop>
                 <input type="checkbox" :checked="skill.enabled" @change="toggleSkill(skill)" />
                 <span class="toggle-slider"></span>
               </label>
+              <span
+                v-else
+                class="virtual-toggle-hint"
+                :title="$t('skills.virtualReadonlyHint')"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </svg>
+              </span>
             </div>
 
             <p class="skill-desc">{{ skill.description || t('skills.noDescription') }}</p>
@@ -129,6 +144,7 @@
                   </svg>
                 </button>
                 <button
+                  v-if="!isSkillRowVirtual(skill)"
                   class="skill-btn"
                   :title="t('skills.actions.configure')"
                   @click="openEditFromCard(skill)"
@@ -139,7 +155,7 @@
                   </svg>
                 </button>
                 <button
-                  v-if="skill.skillType !== 'builtin'"
+                  v-if="skill.skillType !== 'builtin' && !isSkillRowVirtual(skill)"
                   class="skill-btn danger"
                   :title="t('skills.actions.delete')"
                   @click="deleteSkill(skill)"
@@ -274,6 +290,9 @@
           </button>
           <button class="detail-tab" :class="{ active: detailTab === 'lessons' }" @click="detailTab = 'lessons'">
             {{ t('skills.detail.lessons') }}
+          </button>
+          <button class="detail-tab" :class="{ active: detailTab === 'secrets' }" @click="detailTab = 'secrets'">
+            {{ t('skills.detail.secrets') }}
           </button>
           <button class="detail-tab" :class="{ active: detailTab === 'memory' }" @click="detailTab = 'memory'">
             {{ t('skills.detail.memory') }}
@@ -466,7 +485,12 @@
             <span v-if="detailSkill.securityScanTime" class="scan-findings-time">
               · {{ formatScanTime(detailSkill.securityScanTime) }}
             </span>
+            <!-- Issue #83 follow-up: virtual MCP/ACP skills can't be rescanned —
+                 backend rejects with err.skill.virtual_readonly. Hide the button
+                 so users don't trigger a guaranteed 4xx; the readonly banner
+                 already tells them where to go. -->
             <button
+              v-if="!isVirtualSkill"
               class="scan-rescan-btn"
               :disabled="rescanning[String(detailSkill.id)]"
               @click="rescanSkill(detailSkill)"
@@ -560,6 +584,16 @@
           <p v-else-if="!detailLessonsRaw" class="detail-empty">{{ t('skills.detail.noLessons') }}</p>
           <pre v-else class="detail-pre">{{ detailLessonsRaw }}</pre>
         </div>
+
+        <!-- Per-skill secrets — env-var key/value table.
+             Plaintext never leaves the server; the panel shows masked
+             previews and routes write/delete through the SkillSecretController. -->
+        <div v-if="detailTab === 'secrets'" class="detail-section">
+          <SkillSecretsPanel
+            :skill-id="detailSkill?.id ?? null"
+            :visible="detailTab === 'secrets'"
+          />
+        </div>
             </div>
           </div>
         </div>
@@ -647,6 +681,7 @@ import { skillApi, skillInstallApi } from '@/api/index'
 import type { Skill, SkillRuntimeStatus, SkillSecurityFinding } from '@/types/index'
 import ImportHubDialog from '@/components/skill/ImportHubDialog.vue'
 import PreflightInstallDialog from '@/components/skill/PreflightInstallDialog.vue'
+import SkillSecretsPanel from '@/components/skill/SkillSecretsPanel.vue'
 import McPagination from '@/components/common/McPagination.vue'
 import SkillIcon from '@/components/common/SkillIcon.vue'
 import SkillIconPicker from '@/components/common/SkillIconPicker.vue'
@@ -684,7 +719,7 @@ const rescanning = ref<Record<string, boolean>>({})
  *  tab for back-compat with any deep links that may pass it. */
 const detailDrawerVisible = ref(false)
 const detailSkill = ref<Skill | null>(null)
-const detailTab = ref<'overview' | 'body' | 'manifest' | 'tools' | 'features' | 'security' | 'lessons' | 'memory'>('overview')
+const detailTab = ref<'overview' | 'body' | 'manifest' | 'tools' | 'features' | 'security' | 'lessons' | 'secrets' | 'memory'>('overview')
 const detailLessonsRaw = ref<string>('')
 const detailLessonsLoading = ref(false)
 const detailEmployees = ref<Array<{ id: number; name: string; icon?: string; binding?: 'explicit' | 'implicit' }>>([])
@@ -740,11 +775,14 @@ const newForm = ref<{ name: string; description: string; icon: string }>({ name:
  *  {@link McpSkillBridge#VIRTUAL_ID_BASE} (= 9e18). The DB update path
  *  doesn't know about them, so the drawer hides the Edit affordance.
  *  Using string-length is robust against JS number precision loss past 2^53. */
-const isVirtualSkill = computed(() => {
-  if (!detailSkill.value?.id) return false
-  const idStr = String(detailSkill.value.id)
+function isVirtualSkillId(id: unknown): boolean {
+  if (id === null || id === undefined) return false
+  const idStr = String(id)
   return idStr.length >= 19 && idStr.startsWith('9')
-})
+}
+/** Per-row check used by the card-level configure / delete buttons. */
+const isSkillRowVirtual = (skill: { id?: unknown } | null | undefined) => isVirtualSkillId(skill?.id)
+const isVirtualSkill = computed(() => isVirtualSkillId(detailSkill.value?.id))
 const isBuiltinDetail = computed(() => detailSkill.value?.skillType === 'builtin' || !!detailSkill.value?.builtin)
 
 /** RFC-090 §4.4 — pre-flight dialog state. */
@@ -783,7 +821,9 @@ const detailManifest = computed(() => detailRuntime.value?.manifest ?? null)
 const detailManifestPretty = computed(() =>
   detailManifest.value ? JSON.stringify(detailManifest.value, null, 2) : '',
 )
-const detailEffectiveTools = computed(() => detailRuntime.value?.effectiveAllowedTools || [])
+const detailEffectiveTools = computed(() =>
+  detailRuntime.value?.effectiveAllowedToolsDisplay || detailRuntime.value?.effectiveAllowedTools || [],
+)
 const detailToolsCount = computed(() => detailEffectiveTools.value.length)
 const detailFeatures = computed(() => {
   const m = detailManifest.value
@@ -795,7 +835,7 @@ const detailFeaturesCount = computed(() => detailFeatures.value.length)
 
 function openDetailDrawer(
   skill: Skill,
-  tab: 'overview' | 'body' | 'tools' | 'features' | 'security' | 'lessons' | 'memory' = 'overview',
+  tab: 'overview' | 'body' | 'tools' | 'features' | 'security' | 'lessons' | 'secrets' | 'memory' = 'overview',
   opts: { editIdentity?: boolean; editBody?: boolean } = {},
 ) {
   detailSkill.value = skill
@@ -1034,9 +1074,14 @@ async function createSkillFromModal() {
 }
 
 /** Old configure-on-card button now lands in the drawer Overview tab in
- *  edit mode — keeps the surface contract but skips the modal trip. */
+ *  edit mode — keeps the surface contract but skips the modal trip.
+ *  Virtual MCP/ACP-derived skills aren't editable; the card-level button
+ *  is hidden for them, but if any other call path reaches here with a
+ *  virtual skill, fall through to view mode rather than opening an edit
+ *  surface that will 4xx on save. */
 function openEditFromCard(skill: Skill) {
-  openDetailDrawer(skill, 'overview', { editIdentity: true })
+  const opts = isSkillRowVirtual(skill) ? undefined : { editIdentity: true }
+  openDetailDrawer(skill, 'overview', opts)
 }
 
 // ==================== Inline edit (Overview / Body) ====================
@@ -1188,6 +1233,14 @@ async function deleteSkill(idOrSkill: string | number | Skill) {
 }
 
 async function toggleSkill(skill: Skill) {
+  // Issue #83: short-circuit if a programmatic caller reaches this for a
+  // virtual skill (the UI hides the toggle, but defense-in-depth keeps the
+  // toast accurate when the backend would otherwise return err.skill.not_found
+  // on builds that pre-date the rejectVirtualSkillMutation guard).
+  if (isSkillRowVirtual(skill)) {
+    ElMessage.warning(t('skills.virtualReadonlyHint'))
+    return
+  }
   try {
     await skillApi.toggle(skill.id, !skill.enabled)
     await loadAll()
@@ -1737,6 +1790,19 @@ html.dark .scan-finding-item { background: rgba(255, 255, 255, 0.05); }
 .toggle-slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: var(--mc-bg-elevated); border-radius: 50%; transition: 0.2s; }
 .toggle-switch input:checked + .toggle-slider { background: var(--mc-primary); }
 .toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
+/* Issue #83: padlock placeholder where the toggle would be on virtual MCP/ACP rows. */
+.virtual-toggle-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 20px;
+  color: var(--mc-text-quaternary);
+  cursor: help;
+  flex-shrink: 0;
+  border-radius: 6px;
+}
+.virtual-toggle-hint:hover { color: var(--mc-text-tertiary); background: var(--mc-bg-sunken); }
 .skill-desc { font-size: 13px; color: var(--mc-text-secondary); margin: 0 0 10px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; flex: 1; }
 
 /* Runtime Status */

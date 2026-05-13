@@ -3,12 +3,15 @@ package vip.mate.agent;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import reactor.core.publisher.Flux;
 import vip.mate.agent.context.ChatOrigin;
 import vip.mate.agent.context.ChatOriginHolder;
+import vip.mate.agent.event.AgentLifecycleEvent;
 import vip.mate.agent.model.AgentEntity;
 import vip.mate.agent.repository.AgentMapper;
 import vip.mate.exception.MateClawException;
@@ -43,6 +46,11 @@ public class AgentService {
     private final MemoryLifecycleMediator lifecycleMediator;
     private final MemoryProperties memoryProperties;
 
+    /** Field-injected publisher for agent_lifecycle trigger events; the
+     *  trigger module's bridge listens and forwards into ingest. */
+    @Autowired(required = false)
+    private ApplicationEventPublisher events;
+
     /** 运行时 Agent 实例缓存（agentId -> BaseAgent） */
     private final Map<Long, BaseAgent> agentInstances = new ConcurrentHashMap<>();
 
@@ -57,9 +65,26 @@ public class AgentService {
      * 按工作区列出 Agent
      */
     public List<AgentEntity> listAgentsByWorkspace(Long workspaceId) {
-        return agentMapper.selectList(new LambdaQueryWrapper<AgentEntity>()
-                .eq(AgentEntity::getWorkspaceId, workspaceId)
-                .orderByDesc(AgentEntity::getCreateTime));
+        return listAgentsByWorkspace(workspaceId, null);
+    }
+
+    /**
+     * 按工作区列出 Agent，可选过滤启用状态。
+     *
+     * @param enabled non-null restricts the result set to agents whose
+     *                {@code enabled} column matches the given value.
+     *                Pass {@code true} from chat selectors so disabled
+     *                agents disappear from the picker; the admin
+     *                management page passes {@code null} to keep
+     *                disabled rows visible for re-enabling.
+     */
+    public List<AgentEntity> listAgentsByWorkspace(Long workspaceId, Boolean enabled) {
+        LambdaQueryWrapper<AgentEntity> q = new LambdaQueryWrapper<AgentEntity>()
+                .eq(AgentEntity::getWorkspaceId, workspaceId);
+        if (enabled != null) {
+            q.eq(AgentEntity::getEnabled, enabled);
+        }
+        return agentMapper.selectList(q.orderByDesc(AgentEntity::getCreateTime));
     }
 
     public AgentEntity getAgent(Long id) {
@@ -75,19 +100,100 @@ public class AgentService {
         if (agent.getAgentType() == null) {
             agent.setAgentType("react");
         }
+        requireUniqueName(agent, null);
         agentMapper.insert(agent);
+        publishLifecycle(agent, "spawned");
         return agent;
     }
 
     public AgentEntity updateAgent(AgentEntity agent) {
+        // Detect enabled-flag flip so the lifecycle event reflects the
+        // intent rather than every metadata edit. Reading the prior row
+        // is cheap and gives us a clean diff source.
+        AgentEntity prior = agentMapper.selectById(agent.getId());
+        // Only re-validate uniqueness when the name actually changes —
+        // a pure metadata edit (icon, prompt, ...) shouldn't pay the
+        // SELECT cost or risk a false positive against the row itself.
+        if (prior != null
+                && agent.getName() != null
+                && !agent.getName().equals(prior.getName())) {
+            // Workspace cannot be moved (Controller pins it to prior.workspaceId),
+            // so reuse it for the lookup even if the incoming DTO left it null.
+            if (agent.getWorkspaceId() == null) {
+                agent.setWorkspaceId(prior.getWorkspaceId());
+            }
+            requireUniqueName(agent, agent.getId());
+        }
         agentMapper.updateById(agent);
         agentInstances.remove(agent.getId());
+        if (prior != null && prior.getEnabled() != null
+                && !prior.getEnabled().equals(agent.getEnabled())) {
+            publishLifecycle(agent,
+                    Boolean.TRUE.equals(agent.getEnabled()) ? "enabled" : "disabled");
+        }
         return agent;
     }
 
+    /**
+     * Friendly business-code surface for the {@code (workspace_id, name)}
+     * unique index added in V102.
+     *
+     * <p>The wire shape is the project-wide R&lt;T&gt; envelope: HTTP status
+     * stays 200 (per the convention in {@code R.fail} and the axios
+     * interceptor in {@code mateclaw-ui/src/api/index.ts}); the 409 lives in
+     * the response body's {@code code} field so the front-end can branch
+     * without breaking on an axios error. Without this pre-check the
+     * duplicate save would surface as an opaque
+     * {@code DataIntegrityViolation} stack trace.
+     *
+     * @param excludeId when non-null, skip this row in the lookup so
+     *                  {@link #updateAgent} doesn't mistake the row for its
+     *                  own duplicate.
+     */
+    private void requireUniqueName(AgentEntity agent, Long excludeId) {
+        if (agent.getName() == null || agent.getName().isBlank()) {
+            throw new MateClawException("err.agent.name_required", 400, "Agent 名称不能为空");
+        }
+        Long workspaceId = agent.getWorkspaceId() == null ? 1L : agent.getWorkspaceId();
+        LambdaQueryWrapper<AgentEntity> q = new LambdaQueryWrapper<AgentEntity>()
+                .eq(AgentEntity::getWorkspaceId, workspaceId)
+                .eq(AgentEntity::getName, agent.getName());
+        if (excludeId != null) {
+            q.ne(AgentEntity::getId, excludeId);
+        }
+        Long count = agentMapper.selectCount(q);
+        if (count != null && count > 0) {
+            throw new MateClawException("err.agent.duplicate_name", 409,
+                    "工作区内已存在同名 Agent: " + agent.getName());
+        }
+    }
+
     public void deleteAgent(Long id) {
+        AgentEntity prior = agentMapper.selectById(id);
         agentMapper.deleteById(id);
         agentInstances.remove(id);
+        if (prior != null) publishLifecycle(prior, "terminated");
+    }
+
+    /**
+     * Best-effort publish of an {@link AgentLifecycleEvent}. A publish
+     * failure must never roll back the agent CRUD that just succeeded —
+     * the agent_lifecycle trigger surface is observability, not the
+     * canonical record.
+     */
+    private void publishLifecycle(AgentEntity agent, String phase) {
+        if (events == null || agent == null) return;
+        try {
+            events.publishEvent(new AgentLifecycleEvent(
+                    agent.getWorkspaceId() == null ? 0L : agent.getWorkspaceId(),
+                    agent.getId() == null ? 0L : agent.getId(),
+                    agent.getName(),
+                    phase,
+                    System.currentTimeMillis()));
+        } catch (Exception e) {
+            log.warn("[AgentService] lifecycle publish failed for agent {} ({}): {}",
+                    agent.getId(), phase, e.getMessage());
+        }
     }
 
     /**

@@ -39,6 +39,7 @@ export function useProviderForm(deps: ListDeps) {
     apiKeyPrefix: 'sk-',
     protocol: 'openai-compatible',
     chatModel: 'OpenAIChatModel',
+    requireApiKey: true,
     generateKwargsText: '{}',
     enableSearch: false,
     searchStrategy: '',
@@ -73,6 +74,7 @@ export function useProviderForm(deps: ListDeps) {
     if (id === 'zhipu-cn-codingplan') return 'https://open.bigmodel.cn/api/coding/paas/v4'
     if (id === 'zhipu-intl-codingplan') return 'https://api.z.ai/api/coding/paas/v4'
     if (id === 'volcengine') return 'https://ark.cn-beijing.volces.com/api/v3'
+    if (id === 'xiaomi-mimo') return 'https://api.xiaomimimo.com/v1'
     return 'https://example.com/v1'
   })
 
@@ -88,6 +90,7 @@ export function useProviderForm(deps: ListDeps) {
     if (id === 'zhipu-cn') return t('settings.model.hints.zhipu')
     if (id === 'zhipu-intl') return t('settings.model.hints.zhipuIntl')
     if (id === 'volcengine') return t('settings.model.hints.volcengine')
+    if (id === 'xiaomi-mimo') return t('settings.model.hints.xiaomiMimo')
     return t('settings.model.hints.openaiCompatible')
   })
 
@@ -108,6 +111,7 @@ export function useProviderForm(deps: ListDeps) {
       apiKeyPrefix: 'sk-',
       protocol: 'openai-compatible',
       chatModel: 'OpenAIChatModel',
+      requireApiKey: true,
       generateKwargsText: '{}',
       enableSearch: false,
       searchStrategy: '',
@@ -132,6 +136,7 @@ export function useProviderForm(deps: ListDeps) {
       apiKeyPrefix: provider.apiKeyPrefix || 'sk-',
       protocol,
       chatModel: provider.chatModel || 'OpenAIChatModel',
+      requireApiKey: protocol === 'openai-compatible' ? provider.requireApiKey !== false : true,
       generateKwargsText: JSON.stringify(kwargs, null, 2),
       enableSearch: searchDefault,
       searchStrategy: (kwargs.searchStrategy as string) || '',
@@ -173,12 +178,16 @@ export function useProviderForm(deps: ListDeps) {
     }
     // RFC-009 P3.5: clamp to non-negative, coerce string input back to integer.
     const fallbackPriority = Math.max(0, Math.floor(Number(providerForm.fallbackPriority) || 0))
+    const requireApiKey = providerForm.protocol === 'openai-compatible'
+      ? providerForm.requireApiKey
+      : true
     if (editingProvider.value) {
       await modelApi.updateProviderConfig(editingProvider.value.id, {
         apiKey: providerForm.apiKey,
         baseUrl: providerForm.baseUrl,
         protocol: providerForm.protocol,
         chatModel: protocolToChatModel(providerForm.protocol),
+        requireApiKey,
         generateKwargs: kwargs,
         fallbackPriority,
       })
@@ -190,6 +199,7 @@ export function useProviderForm(deps: ListDeps) {
         apiKeyPrefix: providerForm.apiKeyPrefix,
         protocol: providerForm.protocol,
         chatModel: protocolToChatModel(providerForm.protocol),
+        requireApiKey,
         models: [],
       })
       if (providerForm.apiKey || providerForm.generateKwargsText || fallbackPriority > 0) {
@@ -198,6 +208,7 @@ export function useProviderForm(deps: ListDeps) {
           baseUrl: providerForm.baseUrl,
           protocol: providerForm.protocol,
           chatModel: protocolToChatModel(providerForm.protocol),
+          requireApiKey,
           generateKwargs: kwargs,
           fallbackPriority,
         })

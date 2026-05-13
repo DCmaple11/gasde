@@ -1,16 +1,27 @@
 package vip.mate.workspace.conversation;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import vip.mate.agent.model.AgentEntity;
 import vip.mate.approval.ApprovalPlaceholderUtil;
 import vip.mate.approval.MetadataDecision;
 import vip.mate.agent.repository.AgentMapper;
+import vip.mate.approval.model.ToolApprovalEntity;
+import vip.mate.approval.repository.ToolApprovalMapper;
+import vip.mate.channel.model.ChannelSessionEntity;
+import vip.mate.channel.repository.ChannelSessionMapper;
+import vip.mate.task.model.AsyncTaskEntity;
+import vip.mate.task.repository.AsyncTaskMapper;
+import vip.mate.workspace.conversation.event.ConversationDeletedEvent;
 import vip.mate.workspace.conversation.model.ConversationEntity;
 import vip.mate.workspace.conversation.model.MessageContentPart;
 import vip.mate.workspace.conversation.model.MessageEntity;
@@ -49,6 +60,23 @@ public class ConversationService {
     private final MessageMapper messageMapper;
     private final AgentMapper agentMapper;
     private final ObjectMapper objectMapper;
+    private final ToolApprovalMapper toolApprovalMapper;
+    private final AsyncTaskMapper asyncTaskMapper;
+    private final ChannelSessionMapper channelSessionMapper;
+    private final ApplicationEventPublisher eventPublisher;
+
+    /**
+     * Optional spill store. Injected via a setter so the existing @RequiredArgsConstructor
+     * stays stable and tests that build the service directly don't need to wire
+     * tool-result storage. When present, deleteConversation also purges any spill
+     * files this conversation produced so they don't outlive the row that owned them.
+     */
+    private vip.mate.agent.graph.executor.ToolResultStorage toolResultStorage;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setToolResultStorage(vip.mate.agent.graph.executor.ToolResultStorage toolResultStorage) {
+        this.toolResultStorage = toolResultStorage;
+    }
 
     /**
      * 获取用户的会话列表（返回 VO，包含 agentName/agentIcon/status）
@@ -360,6 +388,30 @@ public class ConversationService {
     }
 
     /**
+     * Returns the most recent compression boundary row for the conversation,
+     * or {@code null} if no boundary exists yet. Used by the agent loader to
+     * recover the structured summary when the boundary itself sits outside the
+     * recent-message window — without this, a long conversation that already
+     * compacted would feed the model the last N raw messages while silently
+     * dropping the goal / progress digest the boundary holds.
+     *
+     * <p>Implemented as a single indexed query rather than a full
+     * {@code listMessages} + filter so it stays cheap on conversations with
+     * thousands of messages. Selection: {@code role=system} +
+     * {@code metadata like '%compression_summary%'} (the metadata column always
+     * carries that literal — see {@link #saveCompressionSummary}).
+     */
+    public MessageEntity findLatestCompressionBoundary(String conversationId) {
+        return messageMapper.selectOne(new LambdaQueryWrapper<MessageEntity>()
+                .eq(MessageEntity::getConversationId, conversationId)
+                .eq(MessageEntity::getRole, "system")
+                .like(MessageEntity::getMetadata, "compression_summary")
+                .orderByDesc(MessageEntity::getCreateTime)
+                .orderByDesc(MessageEntity::getId)
+                .last("LIMIT 1"));
+    }
+
+    /**
      * 加载最近 N 条消息（倒序取出后翻转为正序）。
      * 利用复合索引 (conversation_id, create_time) 高效分页。
      */
@@ -400,18 +452,108 @@ public class ConversationService {
     }
 
     /**
-     * 将压缩摘要持久化为 role=system 的特殊消息。
-     * 下次加载历史时识别此消息，跳过它之前的已压缩消息。
+     * Persist a compaction boundary as a role=system message. The body is
+     * the summary text; the metadata describes <em>what happened</em> at
+     * this boundary (trigger, pre/post tokens, how many messages were
+     * summarised, how many spill files were produced, how many tail
+     * messages survived). On the next load this row is the cut-off — older
+     * messages are skipped, the model picks up from the summary forward.
+     *
+     * <p>Backward-compat overload: legacy callers that only know the row
+     * count still work and produce a minimal metadata block.
      */
     public void saveCompressionSummary(String conversationId, String summary, int compressedCount) {
+        saveCompressionSummary(conversationId, summary, compressedCount, Map.of());
+    }
+
+    /**
+     * Same as {@link #saveCompressionSummary(String, String, int, Map)} but
+     * returns the inserted row's id so callers (notably
+     * {@code ConversationWindowManager}) can include the {@code summaryId}
+     * in the {@code compact_status} SSE payload. The id is also written back
+     * into the row's metadata JSON by the underlying overload, so the row is
+     * still self-describing if a client misses the SSE event and loads
+     * history later.
+     *
+     * <p>Returns {@code null} when the insert path failed (logged at INFO);
+     * callers should treat that as "no boundary was persisted" and still
+     * broadcast a {@code done} event without {@code summaryId}.
+     */
+    public Long saveCompressionSummaryReturningId(String conversationId, String summary,
+                                                  int compressedCount, Map<String, Object> extraMetadata) {
+        return saveCompressionSummaryInternal(conversationId, summary, compressedCount, extraMetadata);
+    }
+
+    /**
+     * Same as the 3-arg overload but accepts extra structured fields that
+     * are merged into the boundary's metadata JSON. Fields the frontend
+     * and observability pipeline care about:
+     * <ul>
+     *   <li>{@code trigger} — what fired this boundary
+     *       ({@code token_threshold}, {@code user_compact}, etc.)</li>
+     *   <li>{@code preTokens} / {@code postTokens} — context size before
+     *       and after, for the in-prompt status row</li>
+     *   <li>{@code messagesSummarized} / {@code tailKept} — partition
+     *       counts the user sees in the boundary card</li>
+     *   <li>{@code toolResultsSpilled} — how many bodies the spill store
+     *       absorbed during this boundary</li>
+     *   <li>{@code summaryId} — stable id (the inserted message id) for
+     *       deep-linking from the SSE event</li>
+     * </ul>
+     * <p>{@code type=compression_summary} is always present — the loader
+     * keys off it. {@code compressedCount} is kept for backward compat.
+     */
+    public void saveCompressionSummary(String conversationId, String summary, int compressedCount,
+                                       Map<String, Object> extraMetadata) {
+        saveCompressionSummaryInternal(conversationId, summary, compressedCount, extraMetadata);
+    }
+
+    private Long saveCompressionSummaryInternal(String conversationId, String summary, int compressedCount,
+                                                Map<String, Object> extraMetadata) {
         MessageEntity entity = new MessageEntity();
         entity.setConversationId(conversationId);
         entity.setRole("system");
         entity.setContent(summary);
         entity.setStatus("completed");
-        entity.setMetadata("{\"type\":\"compression_summary\",\"compressedCount\":" + compressedCount + "}");
+
+        Map<String, Object> metadata = new java.util.LinkedHashMap<>();
+        metadata.put("type", "compression_summary");
+        metadata.put("compressedCount", compressedCount);
+        if (extraMetadata != null) {
+            extraMetadata.forEach((k, v) -> {
+                if (v != null) metadata.put(k, v);
+            });
+        }
+        // First write a placeholder so the row lands with the structured
+        // fields; we backfill summaryId in a second step once MyBatis Plus
+        // has assigned the snowflake id. ASSIGN_ID actually populates the
+        // id BEFORE flushing the INSERT, but reading it back this way means
+        // the contract holds even if the ID generation strategy changes.
+        try {
+            entity.setMetadata(objectMapper.writeValueAsString(metadata));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            log.warn("[Conversation] Failed to serialise compaction metadata, falling back to minimal: {}",
+                    e.getMessage());
+            entity.setMetadata("{\"type\":\"compression_summary\",\"compressedCount\":" + compressedCount + "}");
+        }
         messageMapper.insert(entity);
-        log.info("[Conversation] Saved compression summary for conv={}, compressedCount={}", conversationId, compressedCount);
+
+        // Backfill summaryId now that the row owns an id. Best-effort: a
+        // failure here doesn't invalidate the boundary itself, it just
+        // means SSE clients won't have a deep-link target for this row.
+        if (entity.getId() != null) {
+            metadata.put("summaryId", entity.getId());
+            try {
+                entity.setMetadata(objectMapper.writeValueAsString(metadata));
+                messageMapper.updateById(entity);
+            } catch (Exception e) {
+                log.warn("[Conversation] Failed to backfill summaryId on compression boundary: {}",
+                        e.getMessage());
+            }
+        }
+        log.info("[Conversation] Saved compression boundary conv={}, compressedCount={}, metadata={}",
+                conversationId, compressedCount, entity.getMetadata());
+        return entity.getId();
     }
 
     public List<MessageVO> listMessageViews(String conversationId) {
@@ -421,15 +563,97 @@ public class ConversationService {
     }
 
     /**
-     * 删除会话（同时删除消息和附件文件）
+     * Delete a conversation and cascade-clean every row that referenced it.
+     * <p>
+     * Tables cleaned in the same transaction:
+     * <ul>
+     *   <li>{@code mate_message} — chat history</li>
+     *   <li>{@code mate_tool_approval} — pending approvals would otherwise
+     *       point to a non-existent conversation and surface as ghost items
+     *       in the approvals list</li>
+     *   <li>{@code mate_async_task} — long-running task records keyed on
+     *       this conversation</li>
+     *   <li>{@code mate_channel_session} — channel-side session row (the
+     *       column is UNIQUE; leaving it would block reuse of the same id)</li>
+     *   <li>{@code mate_conversation} — the conversation itself</li>
+     * </ul>
+     * Child conversations (delegated turns) have their
+     * {@code parent_conversation_id} set to NULL rather than cascade-deleted,
+     * so the user keeps independent access to delegated work.
+     * <p>
+     * Audit / history tables ({@code mate_tool_guard_audit_log},
+     * {@code mate_cron_job_run}, {@code mate_skill.source_conversation_id},
+     * {@code mate_skill_usage_stat}) are intentionally left alone — those
+     * are append-only records that should outlive their source conversation.
+     * <p>
+     * Attachment file cleanup is registered as an after-commit hook so it
+     * runs only when the DB cascade actually persists, and an IO failure
+     * cannot roll back the database deletes.
      */
     @Transactional
     public void deleteConversation(String conversationId) {
-        conversationMapper.delete(new LambdaQueryWrapper<ConversationEntity>()
-                .eq(ConversationEntity::getConversationId, conversationId));
-        messageMapper.delete(new LambdaQueryWrapper<MessageEntity>()
+        int messages = messageMapper.delete(new LambdaQueryWrapper<MessageEntity>()
                 .eq(MessageEntity::getConversationId, conversationId));
-        cleanAttachmentFiles(conversationId);
+        int approvals = toolApprovalMapper.delete(new LambdaQueryWrapper<ToolApprovalEntity>()
+                .eq(ToolApprovalEntity::getConversationId, conversationId));
+        int asyncTasks = asyncTaskMapper.delete(new LambdaQueryWrapper<AsyncTaskEntity>()
+                .eq(AsyncTaskEntity::getConversationId, conversationId));
+        int channelSessions = channelSessionMapper.delete(new LambdaQueryWrapper<ChannelSessionEntity>()
+                .eq(ChannelSessionEntity::getConversationId, conversationId));
+        int childrenUnlinked = conversationMapper.update(null, new LambdaUpdateWrapper<ConversationEntity>()
+                .set(ConversationEntity::getParentConversationId, null)
+                .eq(ConversationEntity::getParentConversationId, conversationId));
+        int conversations = conversationMapper.delete(new LambdaQueryWrapper<ConversationEntity>()
+                .eq(ConversationEntity::getConversationId, conversationId));
+
+        log.info("[Conversation] Deleted {}: messages={}, approvals={}, asyncTasks={},"
+                        + " channelSessions={}, childrenUnlinked={}, conversationRow={}",
+                conversationId, messages, approvals, asyncTasks,
+                channelSessions, childrenUnlinked, conversations);
+
+        registerPostCommitCleanup(conversationId);
+    }
+
+    /**
+     * After-commit cleanup: file IO and the {@link ConversationDeletedEvent}
+     * fan-out both run only if the cascade actually persists, and an IO
+     * failure cannot roll back the DB cascade. The event lets approval and
+     * async-task modules drop their in-memory state (pendingMap, active
+     * pollers, canceled-conv set) so workers cannot resurrect orphan rows
+     * after the conversation row is gone.
+     */
+    private void registerPostCommitCleanup(String conversationId) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    cleanAttachmentFiles(conversationId);
+                    purgeToolResultSpill(conversationId);
+                    eventPublisher.publishEvent(new ConversationDeletedEvent(conversationId));
+                }
+            });
+        } else {
+            cleanAttachmentFiles(conversationId);
+            purgeToolResultSpill(conversationId);
+            eventPublisher.publishEvent(new ConversationDeletedEvent(conversationId));
+        }
+    }
+
+    /**
+     * Best-effort: ask the spill store to delete every tool-result file this
+     * conversation produced. No-op when no spill store is wired in (legacy
+     * deployments or tests that don't need spill). Failures are logged but
+     * never propagated — leaving an extra file on disk is a small price
+     * compared to surfacing IO errors as a 500 on the delete endpoint.
+     */
+    private void purgeToolResultSpill(String conversationId) {
+        if (toolResultStorage == null) return;
+        try {
+            toolResultStorage.purgeConversation(conversationId);
+        } catch (Exception e) {
+            log.warn("[Conversation] tool-result spill purge failed for {}: {}",
+                    conversationId, e.getMessage());
+        }
     }
 
     /**
@@ -478,6 +702,7 @@ public class ConversationService {
                 case "text" -> appendSegment(text, part.getText());
                 case "thinking", "tool_call", "parse_error" -> { /* skip — frontend reads these from contentParts directly */ }
                 case "file" -> appendSegment(text, renderFilePart(part));
+                case "image", "video", "audio", "model3d" -> appendSegment(text, renderMediaPart(part));
                 default -> appendSegment(text, part.getText());
             }
         }
@@ -534,6 +759,36 @@ public class ConversationService {
             return "[附件] " + name;
         }
         return "[附件] " + name + "（路径: " + path + "）";
+    }
+
+    /**
+     * Render an image/video/audio/3D-model content part for the LLM prompt.
+     * <p>
+     * Without this marker, media parts are invisible in the rendered text — the LLM
+     * sees only the user's accompanying text and has no idea an attachment was sent.
+     * That fails closed when the multimodal Media injection in {@code BaseAgent} is
+     * upstream-stripped (model heuristic claims vision but the actual provider drops
+     * the image), leaving the agent to ask "which image?" for an attachment the user
+     * already uploaded. The path lets file-reading tools ({@code read_file},
+     * {@code extract_document_text}, {@code detect_file_type}) work as a fallback.
+     */
+    private String renderMediaPart(MessageContentPart part) {
+        String label = switch (part.getType()) {
+            case "image" -> "[图片]";
+            case "video" -> "[视频]";
+            case "audio" -> "[音频]";
+            case "model3d" -> "[3D 模型]";
+            default -> "[附件]";
+        };
+        String name = safe(part.getFileName());
+        if (name.isBlank()) {
+            name = "未命名";
+        }
+        String path = safe(part.getPath());
+        if (path.isBlank()) {
+            return label + " " + name;
+        }
+        return label + " " + name + "（路径: " + path + "）";
     }
 
     private void appendSegment(StringBuilder builder, String text) {

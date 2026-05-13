@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import vip.mate.exception.MateClawException;
 import vip.mate.skill.model.SkillEntity;
+import vip.mate.skill.repository.SkillFileMapper;
 import vip.mate.skill.repository.SkillMapper;
 import vip.mate.skill.runtime.SkillCatalogSort;
 import vip.mate.skill.runtime.SkillCatalogSorter;
@@ -42,6 +43,7 @@ import java.util.stream.Collectors;
 public class SkillService {
 
     private final SkillMapper skillMapper;
+    private final SkillFileMapper skillFileMapper;
     private final SkillWorkspaceManager workspaceManager;
     private final SkillWorkspaceProperties workspaceProperties;
     private final SkillSecretService skillSecretService;
@@ -300,6 +302,29 @@ public class SkillService {
      * </ul>
      * 仍不允许：name / version / author / skillType / builtin —— 这些是身份字段，
      * 改动会破坏绑定与解析。
+     *
+     * <p>The UI sends a partial body that only contains the fields the
+     * user edited (Identity edit → {@code nameZh/nameEn/description/tags/icon};
+     * Body edit → {@code skillContent}, plus optional {@code sourceCode}).
+     * Every other field on the deserialized entity is {@code null}.
+     *
+     * <p>{@link SkillEntity} declares several
+     * {@code @TableField(updateStrategy = FieldStrategy.ALWAYS)} columns
+     * — {@code name_zh}, {@code name_en}, {@code config_json},
+     * {@code source_code}, {@code skill_content}, {@code manifest_json},
+     * {@code security_scan_result}. Calling
+     * {@code skillMapper.updateById(partial)} would tell MyBatis Plus to
+     * write {@code NULL} into every ALWAYS column missing from the
+     * partial, wiping perfectly valid content on every save. The earlier
+     * #45 fix only protected the resolver's scan write-back; this path
+     * was still exposed (and surfaced as issue #93 when a partial PUT
+     * also took the workspace-sync branch with a {@code null} name and
+     * NPE'd inside {@code sanitizeName}).
+     *
+     * <p>Fix: merge non-null fields from the partial onto a copy of the
+     * existing row, then persist the merged entity. Same shape as the
+     * builtin branch above, just with a wider whitelist for dynamic
+     * skills.
      */
     public SkillEntity updateSkill(SkillEntity skill) {
         SkillEntity existing = getSkill(skill.getId());
@@ -307,7 +332,7 @@ public class SkillService {
         if (Boolean.TRUE.equals(existing.getBuiltin())) {
             // Functional fields
             existing.setEnabled(skill.getEnabled() != null ? skill.getEnabled() : existing.getEnabled());
-            existing.setConfigJson(skill.getConfigJson());
+            if (skill.getConfigJson() != null) existing.setConfigJson(skill.getConfigJson());
             existing.setDescription(skill.getDescription() != null ? skill.getDescription() : existing.getDescription());
             if (skill.getSkillContent() != null) {
                 existing.setSkillContent(skill.getSkillContent());
@@ -335,20 +360,36 @@ public class SkillService {
             return existing;
         }
 
-        // 非内置技能：允许修改所有字段，但不允许改为 builtin
-        skill.setBuiltin(false);
-        skillMapper.updateById(skill);
-        log.info("Updated skill: {}", skill.getName());
+        // 非内置技能：merge non-null fields from the partial onto the
+        // existing row. name / skillType / builtin stay locked because
+        // they're identity fields whose change would orphan bindings
+        // and break the resolver.
+        if (skill.getDescription() != null) existing.setDescription(skill.getDescription());
+        if (skill.getIcon() != null) existing.setIcon(skill.getIcon());
+        if (skill.getVersion() != null && !skill.getVersion().isBlank()) existing.setVersion(skill.getVersion());
+        if (skill.getAuthor() != null) existing.setAuthor(skill.getAuthor());
+        if (skill.getEnabled() != null) existing.setEnabled(skill.getEnabled());
+        if (skill.getTags() != null) existing.setTags(skill.getTags());
+        if (skill.getNameZh() != null) existing.setNameZh(skill.getNameZh());
+        if (skill.getNameEn() != null) existing.setNameEn(skill.getNameEn());
+        if (skill.getConfigJson() != null) existing.setConfigJson(skill.getConfigJson());
+        if (skill.getSourceCode() != null) existing.setSourceCode(skill.getSourceCode());
+        if (skill.getSkillContent() != null) existing.setSkillContent(skill.getSkillContent());
+        if (skill.getManifestJson() != null) existing.setManifestJson(skill.getManifestJson());
+        existing.setBuiltin(false);
+
+        skillMapper.updateById(existing);
+        log.info("Updated skill: {}", existing.getName());
 
         // 若 skillContent 变更且约定工作区存在，同步 SKILL.md
-        syncSkillContentToWorkspace(skill);
+        syncSkillContentToWorkspace(existing);
 
         // 刷新 runtime cache
         if (runtimeService != null) {
             runtimeService.refreshActiveSkills();
         }
 
-        return skill;
+        return existing;
     }
 
     /**
@@ -401,6 +442,10 @@ public class SkillService {
                     "内置技能不可硬删除: " + skill.getName());
         }
         skillMapper.hardDeleteById(id); // bypass the logical-delete flag
+        int filesDropped = skillFileMapper.deleteBySkillId(id);
+        if (filesDropped > 0) {
+            log.info("Hard-deleted {} bundle file row(s) for skill {}", filesDropped, skill.getName());
+        }
         log.info("Hard-deleted skill (physical delete + purge): {}", skill.getName());
 
         // RFC-091 settings bridge — purge any per-skill secrets so a

@@ -5,6 +5,7 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.web.bind.annotation.*;
 import vip.mate.approval.ApprovalWorkflowService;
 import vip.mate.common.result.R;
@@ -97,8 +98,12 @@ public class SecurityController {
     public R<ToolGuardRuleEntity> createRule(@RequestBody ToolGuardRuleEntity rule) {
         try {
             return R.ok(ruleService.createRule(rule));
-        } catch (Exception e) {
+        } catch (IllegalArgumentException e) {
             return R.fail(e.getMessage());
+        } catch (DuplicateKeyException e) {
+            // Race fallback: pre-check passed but a concurrent insert took the slot.
+            String ruleId = rule != null && rule.getRuleId() != null ? rule.getRuleId().trim() : "";
+            return R.fail("Rule ID already exists: " + ruleId);
         }
     }
 
@@ -132,6 +137,17 @@ public class SecurityController {
     public R<String> deleteRule(@PathVariable String ruleId) {
         try {
             ruleService.deleteRule(ruleId);
+            return R.ok("删除成功");
+        } catch (IllegalArgumentException e) {
+            return R.fail(e.getMessage());
+        }
+    }
+
+    @Operation(summary = "按主键 ID 删除自定义规则（兜底，rule_id 异常时使用）")
+    @DeleteMapping("/guard/rules/by-id/{id}")
+    public R<String> deleteRuleByPk(@PathVariable Long id) {
+        try {
+            ruleService.deleteRuleByPk(id);
             return R.ok("删除成功");
         } catch (IllegalArgumentException e) {
             return R.fail(e.getMessage());

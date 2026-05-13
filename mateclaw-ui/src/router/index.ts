@@ -40,6 +40,12 @@ const router = createRouter({
           meta: { title: 'Wiki' },
         },
         {
+          path: 'enterprise',
+          name: 'Enterprise',
+          component: () => import('@/views/Enterprise/index.vue'),
+          meta: { title: 'Enterprise Scenarios' },
+        },
+        {
           path: 'memory',
           name: 'Memory',
           component: () => import('@/views/Memory/index.vue'),
@@ -163,6 +169,18 @@ const router = createRouter({
               name: 'SettingsCronJobs',
               component: () => import('@/views/CronJobs.vue'),
               meta: { title: 'Settings - Cron Jobs' },
+            },
+            {
+              path: 'workflows',
+              name: 'SettingsWorkflows',
+              component: () => import('@/views/Workflows.vue'),
+              meta: { title: 'Settings - Workflows' },
+            },
+            {
+              path: 'triggers',
+              name: 'SettingsTriggers',
+              component: () => import('@/views/Triggers.vue'),
+              meta: { title: 'Settings - Triggers' },
             },
             {
               path: 'datasources',

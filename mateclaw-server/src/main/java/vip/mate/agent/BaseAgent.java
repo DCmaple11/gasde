@@ -10,7 +10,12 @@ import org.springframework.core.io.FileSystemResource;
 import org.springframework.util.MimeType;
 import reactor.core.publisher.Flux;
 import vip.mate.approval.ApprovalPlaceholderUtil;
+import vip.mate.llm.model.ModelConfigEntity;
+import vip.mate.llm.routing.MediaCaptionService;
+import vip.mate.llm.routing.MultimodalRouter;
+import vip.mate.llm.routing.model.MultimodalRoutingDecision;
 import vip.mate.llm.service.ModelCapabilityService;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
 import vip.mate.workspace.conversation.ConversationService;
 import vip.mate.workspace.conversation.model.MessageContentPart;
 import vip.mate.workspace.conversation.model.MessageEntity;
@@ -20,6 +25,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -84,6 +90,31 @@ public abstract class BaseAgent {
 
     /** 构建时使用的 provider ID（运行时快照） */
     protected String runtimeProviderId;
+
+    /**
+     * Full runtime model configuration used by the multimodal router to
+     * decide whether the primary model can handle attachments natively.
+     * Set by {@code AgentGraphBuilder} alongside {@link #modelCapabilities}.
+     */
+    protected ModelConfigEntity runtimeModelConfig;
+
+    /**
+     * The agent's effective tool set. Lifted from subclasses so
+     * {@link #buildUserMessage} can ask whether the agent has any media-capable
+     * tool when the primary model rejects an attachment.
+     */
+    protected vip.mate.agent.AgentToolSet toolSet;
+
+    /**
+     * Optional sidecar routing services. Null when not wired (e.g. tests with
+     * minimal builders); the routing path then degrades to the legacy
+     * skip-with-text-hint behavior without any extra LLM calls.
+     */
+    protected MultimodalRouter multimodalRouter;
+    protected MediaCaptionService mediaCaptionService;
+
+    /** Locale used when prompting the vision sidecar. Defaults to zh-CN when unset. */
+    protected java.util.Locale userLocale = java.util.Locale.SIMPLIFIED_CHINESE;
 
 
     protected BaseAgent(ChatClient chatClient, ConversationService conversationService) {
@@ -206,14 +237,43 @@ public abstract class BaseAgent {
                     agentName, history.size(), totalCount, windowSize);
         }
 
-        // ===== 识别持久化的压缩摘要：从摘要位置开始，跳过更早消息 =====
-        for (int i = 0; i < history.size(); i++) {
+        // ===== Slice from the LATEST compression boundary, not the first =====
+        // A long-running conversation can accumulate several boundaries; the
+        // newest one is the only relevant cut-off because every earlier
+        // boundary's content is already folded into the newer summary. Walking
+        // forward and breaking on the first boundary kept everything between
+        // boundaries — the very redundancy compaction was supposed to remove.
+        boolean boundaryFoundInWindow = false;
+        for (int i = history.size() - 1; i >= 0; i--) {
             MessageEntity msg = history.get(i);
             if ("system".equals(msg.getRole()) && isCompressionSummary(msg)) {
                 history = new ArrayList<>(history.subList(i, history.size()));
-                log.info("[{}] Found compression summary, loading from index {} ({} messages)",
+                boundaryFoundInWindow = true;
+                log.info("[{}] Found latest compression boundary at index {}; loading {} messages forward",
                         agentName, i, history.size());
                 break;
+            }
+        }
+
+        // ===== Latest boundary may live OUTSIDE the recent window =====
+        // On a long conversation that compacted hours/days ago and has paged
+        // fewer than `windowSize` new messages since, `listRecentMessages`
+        // returns only the raw tail — the boundary sat at index 0 of the
+        // original list and never made it into `history`. Without prepending
+        // it, the model would forget the original goal even though we already
+        // paid the LLM cost to produce a structured summary.
+        if (!boundaryFoundInWindow && totalCount > windowSize) {
+            try {
+                MessageEntity latestBoundary = conversationService.findLatestCompressionBoundary(conversationId);
+                if (latestBoundary != null) {
+                    history = new ArrayList<>(history);
+                    history.add(0, latestBoundary);
+                    log.info("[{}] Prepended out-of-window compression boundary id={} so the model keeps the summary context",
+                            agentName, latestBoundary.getId());
+                }
+            } catch (Exception e) {
+                log.warn("[{}] findLatestCompressionBoundary failed; loading recent window without boundary: {}",
+                        agentName, e.getMessage());
             }
         }
 
@@ -270,7 +330,123 @@ public abstract class BaseAgent {
         while (!messages.isEmpty() && messages.get(messages.size() - 1) instanceof UserMessage) {
             messages.remove(messages.size() - 1);
         }
+
+        // Head guard — orphan tool-response strip.
+        //
+        // Independent of the compaction pair-safe boundary in
+        // ConversationWindowManager: that one protects the *compaction* cut,
+        // this one protects the *pagination* cut. listRecentMessages returns
+        // the last N rows verbatim, and the first row of that page can be a
+        // ToolResponseMessage whose owning AssistantMessage sat one row
+        // earlier — i.e. outside the page. Sending such a sequence to any
+        // OpenAI-compatible provider returns 400 because every tool response
+        // must be preceded by an assistant message issuing that tool_call_id.
+        //
+        // The boundary prepend earlier inserts a SystemMessage at the head;
+        // the orphan, if present, sits at index 1 in that case. Skip leading
+        // SystemMessages and drop any leading ToolResponseMessage whose
+        // response ids are not all issued by a *preceding* AssistantMessage
+        // — i.e. one we have already walked past in this scan. Provider
+        // validity is order-sensitive; a later same-id assistant deeper in
+        // the window does NOT redeem an earlier orphan. See
+        // stripHeadOrphanToolResponses below for the forward-scan details.
+        //
+        // Dropping is correct rather than expanding backward to fetch the
+        // missing assistant: if the AssistantMessage is outside the window,
+        // its content is already lost to the model anyway, and the boundary
+        // summary (if any) covers it. Keeping the orphan would just trade a
+        // dropped row for a 400.
+        stripHeadOrphanToolResponses(messages, agentName);
         return messages;
+    }
+
+    /**
+     * Drop leading {@link ToolResponseMessage}s whose owning
+     * {@link AssistantMessage} sits <em>before</em> them in this list. Provider
+     * validity is order-sensitive: a tool response must follow the assistant
+     * that issued the tool_call_id; an unrelated later AssistantMessage that
+     * happens to carry the same id does not redeem an earlier orphan.
+     *
+     * <p>Algorithm: forward scan with a {@code seenIssuedIds} set. Leading
+     * {@link SystemMessage}s (boundary rows, system prompts) pass through
+     * untouched but contribute no ids. The first {@link AssistantMessage} or
+     * {@link UserMessage} we hit stops the repair walk — by that point we're
+     * out of head-orphan territory. Every {@link ToolResponseMessage} we
+     * encounter before that stop is checked against {@code seenIssuedIds};
+     * if every response id is unseen, the message is dropped and the scan
+     * re-examines the new head. A response whose ids are all in the seen
+     * set (e.g. {@code [system, assistant(X), toolResponse(X), ...]} when
+     * the assistant fell at index 1 of the slice) is left in place.
+     *
+     * <p>Mixed responses (some ids matched, some not) inside a single
+     * leading {@code ToolResponseMessage} are dropped wholesale rather than
+     * surgically rewritten — the provider would reject partially-broken
+     * sequences anyway, and the mixed case implies an upstream invariant
+     * violation that surfaces in logs.
+     *
+     * <p>Package-private + static so unit tests can drive it without standing
+     * up a full BaseAgent subclass.
+     */
+    static int stripHeadOrphanToolResponses(List<Message> messages, String agentName) {
+        if (messages.isEmpty()) return 0;
+
+        // Built up as we walk; only assistants we've already passed count
+        // toward "preceding". An assistant that sits behind a head orphan is
+        // irrelevant: provider order-validity asks "was this tool_call id
+        // issued BEFORE this response?", not "anywhere in the prompt".
+        Set<String> seenIssuedIds = new HashSet<>();
+
+        int dropped = 0;
+        int i = 0;
+        while (i < messages.size()) {
+            Message m = messages.get(i);
+            if (m instanceof SystemMessage) {
+                // Boundary rows / system prompts pass through; advance and
+                // keep looking for orphan tool responses that sit behind them.
+                i++;
+                continue;
+            }
+            if (m instanceof AssistantMessage am) {
+                // Reached a preceding assistant — head danger is over. The
+                // tool_call ids it issued are valid for any tool responses
+                // that follow, but we stop the repair walk here either way.
+                if (am.getToolCalls() != null) {
+                    for (AssistantMessage.ToolCall tc : am.getToolCalls()) {
+                        if (tc.id() != null && !tc.id().isEmpty()) {
+                            seenIssuedIds.add(tc.id());
+                        }
+                    }
+                }
+                break;
+            }
+            if (m instanceof ToolResponseMessage trm) {
+                // Every response id must have been issued by a preceding
+                // assistant we already walked through. If any single id is
+                // missing from seenIssuedIds, the message is invalid in
+                // place. Empty / null ids don't count for or against.
+                boolean anyUnmatched = trm.getResponses().stream()
+                        .map(ToolResponseMessage.ToolResponse::id)
+                        .filter(id -> id != null && !id.isEmpty())
+                        .anyMatch(id -> !seenIssuedIds.contains(id));
+                if (anyUnmatched) {
+                    messages.remove(i);
+                    dropped++;
+                    continue; // re-examine the new messages[i]
+                }
+                // All ids match a preceding assistant — keep, and stop the
+                // repair walk. Anything past here is well-formed by
+                // construction (provider validates each subsequent pair as
+                // we go).
+                break;
+            }
+            // UserMessage (or anything else) — past the head danger. Stop.
+            break;
+        }
+        if (dropped > 0) {
+            log.info("[{}] Stripped {} leading orphan ToolResponseMessage(s) — no preceding AssistantMessage in scope",
+                    agentName, dropped);
+        }
+        return dropped;
     }
 
     /**
@@ -510,34 +686,87 @@ public abstract class BaseAgent {
     }
 
     /**
-     * 构建 UserMessage，支持 multimodal：如果消息包含图片/视频附件，直接注入 Spring AI Media 对象，
-     * 让模型在 prompt 中直接看到媒体内容，不需要再调 MCP read_media_file 工具。
+     * Build a {@link UserMessage} for the current turn, including any image/video
+     * media the agent's primary model can handle natively. Returns the message
+     * paired with the {@link MultimodalRoutingDecision} taken so the caller can
+     * persist it as message metadata and emit a routing event.
      */
-    protected UserMessage buildUserMessage(MessageEntity message, String renderedContent) {
-        return buildUserMessage(message, renderedContent, true);
+    protected CurrentTurnUserMessage buildUserMessageForCurrentTurn(MessageEntity message, String renderedContent) {
+        return buildUserMessageInternal(message, renderedContent, true);
     }
 
     /**
-     * @param injectMedia when {@code false} (history replay), skip the Media-loading
-     *                    branch entirely and return text-only — providers like Zhipu
-     *                    GLM-5V cap at 1 video per request, so re-injecting historical
-     *                    attachments on every turn breaks the call.
+     * History-replay variant: text-only, no media reinjected, no routing decision.
+     * Many providers cap at one video per request, so re-injecting old attachments
+     * on every replay would break the call.
      */
+    protected UserMessage buildUserMessage(MessageEntity message, String renderedContent) {
+        return buildUserMessageInternal(message, renderedContent, true).userMessage();
+    }
+
     protected UserMessage buildUserMessage(MessageEntity message, String renderedContent, boolean injectMedia) {
+        return buildUserMessageInternal(message, renderedContent, injectMedia).userMessage();
+    }
+
+    private CurrentTurnUserMessage buildUserMessageInternal(MessageEntity message, String renderedContent, boolean injectMedia) {
         if (!injectMedia) {
-            return new UserMessage(renderedContent == null ? "" : renderedContent);
+            return new CurrentTurnUserMessage(
+                    new UserMessage(renderedContent == null ? "" : renderedContent),
+                    null);
         }
         List<MessageContentPart> parts = conversationService.parseMessageParts(message);
+
+        // Sidecar routing — runs first so caption text gets folded into finalText
+        // before native media injection considers the same parts again.
+        MultimodalRoutingDecision decision = multimodalRouter != null
+                ? multimodalRouter.route(parts, runtimeModelConfig)
+                : MultimodalRoutingDecision.none();
+
+        StringBuilder textBuilder = new StringBuilder(renderedContent == null ? "" : renderedContent);
+        java.util.Set<String> sidecarHandledIdentifiers = new java.util.HashSet<>();
+        if (decision.strategy() == MultimodalRoutingDecision.Strategy.SIDECAR
+                && mediaCaptionService != null
+                && decision.sidecarModel() != null) {
+            for (MessageContentPart part : parts) {
+                if (part == null) continue;
+                String contentType = part.getContentType();
+                boolean isImage = ("image".equals(part.getType()) || "file".equals(part.getType()))
+                        && contentType != null && contentType.startsWith("image/")
+                        && !contentType.contains("svg");
+                if (!isImage) continue;
+                MediaCaptionService.CaptionResult result = mediaCaptionService.caption(
+                        decision.sidecarModel(), part, userLocale);
+                if (result.isFailure()) {
+                    log.warn("[{}] Sidecar caption failed for {}: {}",
+                            agentName, part.getFileName(), result.failure().getMessage());
+                    textBuilder.append("\n\n[系统提示] 视觉模型未能解析附件 ")
+                            .append(part.getFileName())
+                            .append("，请稍后重试或在「设置 → 模型」检查视觉模型配置。");
+                    continue;
+                }
+                textBuilder.append("\n\n[图片附件描述: ")
+                        .append(part.getFileName() == null ? "image" : part.getFileName())
+                        .append("]\n")
+                        .append(result.description())
+                        .append("\n[/图片附件描述]");
+                String identifier = identifyPart(part);
+                if (identifier != null) sidecarHandledIdentifiers.add(identifier);
+            }
+        }
+
         List<Media> mediaList = new ArrayList<>();
-        // Reasons for attachments that the model cannot consume — surfaced to the agent
-        // via the user message text so it does not hallucinate a tool call to read them.
-        // See issue #44.
         List<String> skippedAttachments = new ArrayList<>();
         boolean videoSupported = modelSupportsVideo();
         boolean visionSupported = modelSupportsVision();
 
         for (MessageContentPart part : parts) {
             if (part == null) continue;
+            // Sidecar already produced text for this image; never inject the
+            // raw bytes — the primary model would receive them and try to
+            // process natively, defeating the cost-saving purpose.
+            String identifier = identifyPart(part);
+            if (identifier != null && sidecarHandledIdentifiers.contains(identifier)) continue;
+
             String partType = part.getType();
             String contentType = part.getContentType();
             // image 类型的 part 可能没有精确 contentType，补全为 image/jpeg
@@ -607,21 +836,88 @@ public abstract class BaseAgent {
             }
         }
 
-        String finalText = renderedContent;
         if (!skippedAttachments.isEmpty()) {
-            finalText = (renderedContent == null ? "" : renderedContent)
-                    + "\n\n[系统提示] 以下附件未能传入当前模型：" + String.join("、", skippedAttachments)
-                    + "。\n请用对话语言清晰、友好地告诉用户：当前模型无法处理这类附件，建议切换到具备相应能力的多模态模型（图片需视觉模型，视频需视频理解模型）后重新上传。"
-                    + "不要调用任何工具（包括 ffmpeg、浏览器、文件读取等）尝试解析这些附件。";
+            textBuilder.append("\n\n[系统提示] 以下附件未能传入当前模型：")
+                    .append(String.join("、", skippedAttachments))
+                    .append("。");
+            // Only suggest switching models when no media-capable tool is bound
+            // either. With a media tool the LLM may legitimately choose to
+            // delegate to the tool — never instruct it not to use tools.
+            if (!hasMediaCapableTools()) {
+                textBuilder.append("\n请用对话语言清晰、友好地告诉用户：当前模型无法处理这类附件，建议切换到具备相应能力的多模态模型，或在「设置 → 模型」中配置视觉/视频模型作为旁路。");
+            }
         }
 
-        if (mediaList.isEmpty()) {
-            return new UserMessage(finalText);
+        String finalText = textBuilder.toString();
+        UserMessage built = mediaList.isEmpty()
+                ? new UserMessage(finalText)
+                : UserMessage.builder().text(finalText).media(mediaList).build();
+        return new CurrentTurnUserMessage(built, decision);
+    }
+
+    /**
+     * Stable identifier for de-duplicating parts already handled by the sidecar
+     * pass. Falls back across {@code path → mediaId → fileName} since not every
+     * channel populates the same field.
+     */
+    private static String identifyPart(MessageContentPart part) {
+        if (part == null) return null;
+        if (part.getPath() != null && !part.getPath().isBlank()) return "p:" + part.getPath();
+        if (part.getMediaId() != null && !part.getMediaId().isBlank()) return "m:" + part.getMediaId();
+        if (part.getFileName() != null && !part.getFileName().isBlank()) return "f:" + part.getFileName();
+        return null;
+    }
+
+    /**
+     * True if the agent has at least one tool whose name or description
+     * suggests it can read images / video / audio. The check is intentionally
+     * loose — false positives just mean the agent is allowed to attempt media
+     * processing on its own, which is the safer default.
+     */
+    private static final Set<String> MEDIA_TOOL_KEYWORDS = Set.of(
+            "image", "图片", "vision", "视觉",
+            "video", "视频", "ffmpeg",
+            "ocr", "caption", "media", "audio", "音频");
+
+    private boolean hasMediaCapableTools() {
+        if (toolSet == null) return false;
+        var callbacks = toolSet.callbacks();
+        if (callbacks == null || callbacks.isEmpty()) return false;
+        return callbacks.stream().anyMatch(cb -> {
+            try {
+                String name = String.valueOf(cb.getToolDefinition().name()).toLowerCase();
+                String desc = String.valueOf(cb.getToolDefinition().description()).toLowerCase();
+                return MEDIA_TOOL_KEYWORDS.stream().anyMatch(k -> name.contains(k) || desc.contains(k));
+            } catch (Exception e) {
+                return false;
+            }
+        });
+    }
+
+    /**
+     * Pair returned from the current-turn user message build path: the assembled
+     * {@link UserMessage} and the routing decision the caller should persist as
+     * {@code metadata.routing} and surface to the SSE consumer.
+     */
+    public record CurrentTurnUserMessage(UserMessage userMessage, MultimodalRoutingDecision routingDecision) {}
+
+    /**
+     * Extract a routing-decision payload from the graph input map (placed there
+     * by {@code buildInitialState}) and turn it into a startup
+     * {@link vip.mate.agent.AgentService.StreamDelta} the SSE accumulator can
+     * persist. Returns an empty Flux when no routing happened this turn so we
+     * don't emit zero-value events.
+     */
+    @SuppressWarnings("unchecked")
+    public static reactor.core.publisher.Flux<vip.mate.agent.AgentService.StreamDelta> routingStartupDelta(
+            java.util.Map<String, Object> inputs) {
+        Object decision = inputs.get(vip.mate.agent.graph.state.MateClawStateKeys.ROUTING_DECISION);
+        if (decision instanceof java.util.Map<?, ?> map && !map.isEmpty()) {
+            return reactor.core.publisher.Flux.just(vip.mate.agent.AgentService.StreamDelta.event(
+                    vip.mate.agent.GraphEventPublisher.EVENT_ROUTING_DECISION,
+                    (java.util.Map<String, Object>) map));
         }
-        return UserMessage.builder()
-                .text(finalText)
-                .media(mediaList)
-                .build();
+        return reactor.core.publisher.Flux.empty();
     }
 
     /**
@@ -642,6 +938,17 @@ public abstract class BaseAgent {
      * @return 带图片 Media 的 UserMessage（如果有图片附件），否则纯文本 UserMessage
      */
     protected UserMessage buildCurrentUserMessage(String conversationId, String userMessageText) {
+        return buildCurrentUserMessageWithRouting(conversationId, userMessageText).userMessage();
+    }
+
+    /**
+     * Same as {@link #buildCurrentUserMessage} but also returns the multimodal
+     * routing decision taken for this turn so the caller can persist it as
+     * {@code metadata.routing} and emit a SSE-side event for the chat UI.
+     * Returns a decision with NONE strategy when the message has no attachments
+     * the primary model can't already handle.
+     */
+    protected CurrentTurnUserMessage buildCurrentUserMessageWithRouting(String conversationId, String userMessageText) {
         try {
             List<MessageEntity> history = conversationService.listMessages(conversationId);
             // 倒序取最后一条 user 消息（buildInitialState 在 saveMessage 后调用，所以最后一条就是当前消息）
@@ -650,14 +957,14 @@ public abstract class BaseAgent {
                 if ("user".equals(msg.getRole())) {
                     // 用 DB 中的实际内容（可能包含 contentParts），不用传入的 text
                     String content = conversationService.renderMessageContent(msg);
-                    return buildUserMessage(msg, content != null && !content.isBlank() ? content : userMessageText);
+                    return buildUserMessageForCurrentTurn(msg, content != null && !content.isBlank() ? content : userMessageText);
                 }
             }
         } catch (Exception e) {
             log.debug("[{}] Failed to load current user message parts for multimodal: {}",
                     agentName, e.getMessage());
         }
-        return new UserMessage(userMessageText);
+        return new CurrentTurnUserMessage(new UserMessage(userMessageText), null);
     }
 
     protected Path resolveImagePath(String relativePath) {

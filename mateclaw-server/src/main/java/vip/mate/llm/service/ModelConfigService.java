@@ -23,6 +23,7 @@ public class ModelConfigService {
 
     private final ModelConfigMapper modelConfigMapper;
     private final ApplicationEventPublisher eventPublisher;
+    private final ModelCapabilityService modelCapabilityService;
 
     /**
      * Lazy to break circular dependency: ModelProviderService → ModelConfigService.
@@ -42,10 +43,10 @@ public class ModelConfigService {
     public List<ModelConfigEntity> listEnabledModels() {
         return modelConfigMapper.selectList(new LambdaQueryWrapper<ModelConfigEntity>()
                 .eq(ModelConfigEntity::getEnabled, true)
-                .eq(ModelConfigEntity::getProvider, "dashscope")
                 // 仅 chat 类型（排除 embedding），NULL 兼容老数据
                 .and(w -> w.isNull(ModelConfigEntity::getModelType)
                            .or().eq(ModelConfigEntity::getModelType, "chat"))
+                .orderByAsc(ModelConfigEntity::getProvider)
                 .orderByDesc(ModelConfigEntity::getIsDefault)
                 .orderByAsc(ModelConfigEntity::getName));
     }
@@ -67,17 +68,40 @@ public class ModelConfigService {
      * </ul>
      */
     public List<ModelConfigEntity> listByType(String modelType) {
+        return listByType(modelType, null);
+    }
+
+    /**
+     * Optional modality filter (case-insensitive: {@code "vision" / "video" / "audio"}).
+     * When non-null, only enabled rows whose resolved capability set contains the
+     * requested modality survive — used by the multimodal sidecar settings UI to
+     * populate "default vision model" / "default video model" dropdowns.
+     */
+    public List<ModelConfigEntity> listByType(String modelType, String modality) {
+        List<ModelConfigEntity> rows;
         if ("chat".equals(modelType)) {
-            return modelConfigMapper.selectList(new LambdaQueryWrapper<ModelConfigEntity>()
+            rows = modelConfigMapper.selectList(new LambdaQueryWrapper<ModelConfigEntity>()
                     .and(w -> w.isNull(ModelConfigEntity::getModelType)
                                .or().eq(ModelConfigEntity::getModelType, "chat"))
                     .orderByDesc(ModelConfigEntity::getIsDefault)
                     .orderByAsc(ModelConfigEntity::getName));
+        } else {
+            rows = modelConfigMapper.selectList(new LambdaQueryWrapper<ModelConfigEntity>()
+                    .eq(ModelConfigEntity::getModelType, modelType)
+                    .orderByDesc(ModelConfigEntity::getIsDefault)
+                    .orderByAsc(ModelConfigEntity::getName));
         }
-        return modelConfigMapper.selectList(new LambdaQueryWrapper<ModelConfigEntity>()
-                .eq(ModelConfigEntity::getModelType, modelType)
-                .orderByDesc(ModelConfigEntity::getIsDefault)
-                .orderByAsc(ModelConfigEntity::getName));
+        if (modality == null || modality.isBlank()) return rows;
+        ModelCapabilityService.Modality required;
+        try {
+            required = ModelCapabilityService.Modality.valueOf(modality.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return rows;
+        }
+        return rows.stream()
+                .filter(m -> Boolean.TRUE.equals(m.getEnabled()))
+                .filter(m -> modelCapabilityService.supports(m.getModelName(), m.getModalities(), required))
+                .toList();
     }
 
     /**
@@ -107,7 +131,7 @@ public class ModelConfigService {
                 .and(w -> w.isNull(ModelConfigEntity::getModelType)
                            .or().eq(ModelConfigEntity::getModelType, "chat"))
                 .last("LIMIT 1"));
-        if (defaultMarked != null && isProviderConfigured(defaultMarked.getProvider())) {
+        if (defaultMarked != null && isProviderEnabledAndConfigured(defaultMarked.getProvider())) {
             return defaultMarked;
         }
 
@@ -120,7 +144,7 @@ public class ModelConfigService {
                 .orderByDesc(ModelConfigEntity::getIsDefault)
                 .orderByAsc(ModelConfigEntity::getName));
         for (ModelConfigEntity candidate : candidates) {
-            if (isProviderConfigured(candidate.getProvider())) {
+            if (isProviderEnabledAndConfigured(candidate.getProvider())) {
                 return candidate;
             }
         }
@@ -141,12 +165,12 @@ public class ModelConfigService {
      * dependency. Falls back to {@code true} when the service is not yet available
      * (e.g., during early bootstrap) so we don't accidentally block startup.
      */
-    private boolean isProviderConfigured(String providerId) {
+    private boolean isProviderEnabledAndConfigured(String providerId) {
         if (modelProviderService == null || providerId == null) {
             return true;
         }
         try {
-            return modelProviderService.isProviderConfigured(providerId);
+            return modelProviderService.isProviderEnabledAndConfigured(providerId);
         } catch (Exception e) {
             return true; // conservative: don't filter if lookup fails
         }

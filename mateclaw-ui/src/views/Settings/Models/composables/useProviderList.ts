@@ -72,6 +72,8 @@ export function useProviderList() {
 
   const providerIconMap: Record<string, string> = {
     'dashscope': '/icons/providers/dashscope.png',
+    // dashscope-compat shares the same Aliyun DashScope brand — same logo.
+    'dashscope-compat': '/icons/providers/dashscope.png',
     'modelscope': '/icons/providers/modelscope.svg',
     'aliyun-codingplan': '/icons/providers/aliyun-codingplan.svg',
     'aliyun-codingplan-intl': '/icons/providers/aliyun-codingplan.svg',
@@ -100,6 +102,9 @@ export function useProviderList() {
     'volcengine': '/icons/providers/volcengine.svg',
     // volcengine-plan = "Volcano Engine Coding Plan" — same brand, reuse mark.
     'volcengine-plan': '/icons/providers/volcengine.svg',
+    'xiaomi-mimo': '/icons/providers/xiaomimimo.svg',
+    'hunyuan-3d': '/icons/providers/hunyuan-color.svg',
+    'opencode': '/icons/providers/opencode.svg',
     'siliconflow-cn': '/icons/providers/siliconcloud.svg',
     'siliconflow-intl': '/icons/providers/siliconcloud.svg',
     'openai-chatgpt': '/icons/providers/openai.svg',

@@ -17,6 +17,45 @@ import type { Message, MessageContentPart, MessageSegment, StreamPhase, Heartbea
 import { classifyBackendError, type ChatErrorInfo } from '@/types/chatError'
 import { http } from '@/api'
 
+/**
+ * Snapshot of a {@code compact_status} SSE event. Mirrors the payload built
+ * by ConversationWindowManager.broadcastCompactStatus so the UI can render a
+ * progress chip without each consumer reverse-engineering field names.
+ */
+export interface CompactStatusEvent {
+  /** start | pair_safe | summarize | done | skipped | failed */
+  status: 'start' | 'pair_safe' | 'summarize' | 'done' | 'skipped' | 'failed'
+  /** Server clock when the event fired. */
+  timestamp?: number
+  /** Total prompt tokens before compaction began (start / done payloads). */
+  preTokens?: number
+  /** Total prompt tokens after the boundary lands (done payload). */
+  postTokens?: number
+  /** Messages in scope at start. */
+  messagesIn?: number
+  /** Messages folded into the structured summary (done payload). */
+  messagesSummarized?: number
+  /** Recent messages preserved verbatim (done payload). */
+  tailKept?: number
+  /** Tool-result bodies spilled to disk this turn (done payload). */
+  toolResultsSpilled?: number
+  /** Whether the first-user anchor was injected (done payload). */
+  anchored?: boolean
+  /** Why compaction was skipped or failed: insufficient_messages, pair_boundary_collapsed, summary_generation_failed, ... */
+  reason?: string
+  /** Pair-safety boundary moved from / to indices (pair_safe payload). */
+  movedFrom?: number
+  movedTo?: number
+  /** Summary budget the LLM was asked to fit into (summarize payload). */
+  summaryBudget?: number
+  /** Trigger label baked in by the backend (start / done — currently token_threshold). */
+  trigger?: string
+  /** Tail kept fallback when summary generation failed. */
+  fallbackKept?: number
+  /** True when the boundary was served from the in-memory summary cache. */
+  fromCache?: boolean
+}
+
 export interface UseChatOptions {
   /** Base API URL */
   baseUrl: string
@@ -62,6 +101,13 @@ export interface UseChatReturn {
   queueSize: import('vue').ComputedRef<number>
   /** Latest heartbeat data */
   heartbeat: import('vue').Ref<HeartbeatData | null>
+  /**
+   * Latest compact_status SSE event for the active turn. Drives the in-prompt
+   * compaction chip / boundary marker so the user can see "preparing context"
+   * pauses (start → pair_safe → summarize → done/skipped/failed). Cleared back
+   * to {@code null} when a turn finishes, so the chip auto-hides.
+   */
+  compactStatus: import('vue').Ref<CompactStatusEvent | null>
   /**
    * Fine-grained pre-token lifecycle stage. Drives the loading bar copy in the
    * window between "send pressed" and "first delta arrived". `null` once a
@@ -127,6 +173,14 @@ export function useChat(options: UseChatOptions): UseChatReturn {
   let stopFallbackTimer: ReturnType<typeof setTimeout> | null = null
   const streamPhase = ref<StreamPhase>('idle')
   const phaseInfo = ref<PhaseEventData | null>(null)
+  /**
+   * Latest compact_status event for the current turn. Reset to null on
+   * stream end and on every conversation switch so the chip auto-hides.
+   * "done" events are kept on screen for a short interval by the consumer
+   * (see StreamLoadingBar / CompactStatusBadge) rather than being cleared
+   * immediately, so the user gets a chance to see the result.
+   */
+  const compactStatus = ref<CompactStatusEvent | null>(null)
 
   /** All segments of the current assistant message (for segmented display) */
   const currentSegments = ref<MessageSegment[]>([])
@@ -487,6 +541,8 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         const msg = messages.value[msgIndex]
         if (data.promptTokens !== undefined) msg.promptTokens = data.promptTokens
         if (data.completionTokens !== undefined) msg.completionTokens = data.completionTokens
+        if (data.runtimeModel) msg.runtimeModel = data.runtimeModel
+        if (data.runtimeProvider) msg.runtimeProvider = data.runtimeProvider
         // Replace the local temp ID with the backend-persisted ID so reconcile can match by ID
         if (data.assistantMessageId) {
           msg.id = data.assistantMessageId
@@ -500,6 +556,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       : data.status === 'stopped' ? 'stopped' : 'completed'
     if (data.status !== 'awaiting_approval') {
       phaseInfo.value = null
+      compactStatus.value = null
       lifecycleStage.value = null
       expirePendingApprovals(data.status === 'stopped' ? 'stopped' : 'completed')
     }
@@ -582,6 +639,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     error.value = new Error(errorMessage)
     streamPhase.value = 'idle'
     phaseInfo.value = null
+    compactStatus.value = null
     lifecycleStage.value = null
     // Clear queue on error to avoid stale state
     messageQueue.clear()
@@ -725,6 +783,42 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         } as any)
       }
     }
+  })
+
+  // Live recovery affordance event. Emitted by the graph when a turn
+  // ends in a non-transient error (ERROR_FALLBACK). Carries
+  // { errorType, errorMessage, actions } — actions is the ordered list
+  // of buttons the failed-bubble card should render. Persisting onto
+  // metadata.feedbackEvent matches the post-reload code path in
+  // MessageBubble (which reads the same metadata key) so the card
+  // appears immediately during the live stream AND survives a refresh.
+  stream.on('feedback_event', (data) => {
+    if (isStaleEvent(data)) return
+    if (!currentAssistantId.value) return
+    const msg = getMessage(currentAssistantId.value)
+    if (!msg) return
+    const metadata = parseMetadata((msg as any).metadata)
+    updateMessage(currentAssistantId.value, {
+      ...msg,
+      metadata: {
+        ...metadata,
+        feedbackEvent: {
+          errorType: data.errorType,
+          errorMessage: data.errorMessage,
+          actions: data.actions,
+          timestamp: data.timestamp || Date.now(),
+        },
+      },
+    } as any)
+  })
+
+  // Context-compaction progress. Fires before the LLM call when the window
+  // manager has to evict old turns to fit budget. The chip uses this to show
+  // the user that an unexpected pause is the planner thinking about
+  // context, not a network stall.
+  stream.on('compact_status', (data) => {
+    if (isStaleEvent(data)) return
+    compactStatus.value = { ...data } as CompactStatusEvent
   })
 
   stream.on('phase', (data) => {
@@ -1616,6 +1710,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     // Mark as stopped immediately so the UI gives instant feedback
     streamPhase.value = 'stopped'
     phaseInfo.value = null
+    compactStatus.value = null
 
     // Install fallback timer before any await so it is not missed by a concurrent resetForNewConversation
     if (stopFallbackTimer) clearTimeout(stopFallbackTimer)
@@ -1763,6 +1858,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     segIdCounter.value = 0
     streamPhase.value = 'idle'
     phaseInfo.value = null
+    compactStatus.value = null
     lifecycleStage.value = null
     error.value = null
     messageQueue.clear()
@@ -1782,6 +1878,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     hasQueued: messageQueue.hasQueued,
     queueSize: messageQueue.queueSize,
     heartbeat,
+    compactStatus,
     lifecycleStage,
     sendMessage,
     stopGeneration,

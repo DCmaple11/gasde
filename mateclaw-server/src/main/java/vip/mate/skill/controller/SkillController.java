@@ -23,6 +23,7 @@ import vip.mate.skill.synthesis.SkillSynthesisService;
 import vip.mate.skill.runtime.SkillRuntimeService;
 import vip.mate.skill.runtime.model.ResolvedSkill;
 import vip.mate.skill.workspace.BundledSkillSyncer;
+import vip.mate.skill.workspace.SkillFileSyncer;
 import vip.mate.skill.workspace.SkillWorkspaceManager;
 
 import java.util.ArrayList;
@@ -49,6 +50,7 @@ public class SkillController {
     private final SkillRuntimeService skillRuntimeService;
     private final SkillWorkspaceManager workspaceManager;
     private final BundledSkillSyncer bundledSkillSyncer;
+    private final SkillFileSyncer skillFileSyncer;
     private final SkillSynthesisService synthesisService;
     private final SkillDependencyChecker dependencyChecker;
     private final SkillLessonsService lessonsService;
@@ -249,13 +251,88 @@ public class SkillController {
     @Operation(summary = "重新扫描单个技能（RFC-042 §2.3.4）")
     @PostMapping("/{id}/rescan")
     public R<SkillEntity> rescan(@PathVariable Long id) {
+        rejectVirtualSkillMutation(id);
         return R.ok(skillService.rescanSecurity(id));
+    }
+
+    @Operation(summary = "Re-sync this skill's bundle files from DB → local workspace cache",
+            description = "Use after an out-of-band scripts/ change or to recover a missing local cache " +
+                    "in a multi-instance deployment. Pulls every mate_skill_file row owned by the skill " +
+                    "down to disk; if no rows exist yet but local files do, ingests them into the canonical store.")
+    @PostMapping("/{id}/sync-files")
+    public R<Map<String, Object>> syncFiles(@PathVariable Long id) {
+        rejectVirtualSkillMutation(id);
+        SkillEntity skill = skillService.getSkill(id);
+        var report = skillFileSyncer.syncOne(skill);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("skillId", id);
+        body.put("name", skill.getName());
+        body.put("filesMaterialized", report.filesMaterialized());
+        body.put("filesAlreadyCurrent", report.filesAlreadyCurrent());
+        body.put("filesBackfilledFromDisk", report.filesBackfilledFromDisk());
+        body.put("backfilledFromDisk", report.didBackfillFromDisk());
+        return R.ok(body);
+    }
+
+    @Operation(summary = "Re-sync every skill's bundle files (admin)",
+            description = "Bulk variant of /sync-files; primarily for ops debugging when you suspect " +
+                    "the local workspace is out of sync with the canonical store.")
+    @PostMapping("/sync-files")
+    public R<Map<String, Object>> syncAllFiles() {
+        var report = skillFileSyncer.syncAll();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("skillsConsidered", report.skillsConsidered());
+        body.put("skillsBackfilled", report.skillsBackfilled());
+        body.put("filesMaterialized", report.filesMaterialized());
+        body.put("filesAlreadyCurrent", report.filesAlreadyCurrent());
+        body.put("filesBackfilledFromDisk", report.filesBackfilledFromDisk());
+        return R.ok(body);
+    }
+
+    /**
+     * Mutation paths refuse virtual MCP/ACP skill ids upfront. The bridge
+     * synthesizes those rows on the fly from the upstream connection
+     * config; persisting an update against {@code mate_skill} would
+     * either silently no-op (no row to update) or — as users have hit —
+     * throw "技能不存在" because the lookup precedes the update. Sending
+     * a clear 4xx with a redirect hint is the right shape: the user
+     * wants the icon / display name / etc. to stick, and the only place
+     * those fields persist for an MCP entry is the MCP connection page.
+     */
+    private void rejectVirtualSkillMutation(Long id) {
+        if (vip.mate.skill.mcp.McpSkillBridge.isVirtualMcpSkillId(id)
+                || vip.mate.skill.acp.AcpSkillBridge.isVirtualAcpSkillId(id)) {
+            throw new vip.mate.exception.MateClawException(
+                    "err.skill.virtual_readonly",
+                    "MCP/ACP 衍生技能不可在此编辑——请到 Settings ▸ MCP/ACP 连接页修改");
+        }
     }
 
     @Operation(summary = "获取已启用技能列表")
     @GetMapping("/enabled")
     public R<List<SkillEntity>> listEnabled() {
-        return R.ok(skillService.listEnabledSkills());
+        // Mirror the merging the paginated /skills endpoint does so the agent
+        // edit picker (which calls this endpoint) sees MCP- and ACP-derived
+        // virtual skills alongside the persisted ones. The shadow base must
+        // include all real skill names — including disabled ones — so a
+        // disabled real skill correctly suppresses its same-named virtual
+        // twin, matching /skills and /counts.
+        List<SkillEntity> result = new ArrayList<>(skillService.listEnabledSkills());
+        Set<String> realNames = realSkillNames();
+
+        try {
+            result.addAll(filterShadowedVirtualSkills(
+                    mcpSkillBridge.listMcpDerivedSkillEntities(), realNames));
+        } catch (Exception e) {
+            // Bridge failure must not 500 the picker — same defensive stance as /counts.
+        }
+        try {
+            result.addAll(filterShadowedVirtualSkills(
+                    acpSkillBridge.listAcpDerivedSkillEntities(), realNames));
+        } catch (Exception e) {
+            // Bridge failure must not 500 the picker — same defensive stance as /counts.
+        }
+        return R.ok(result);
     }
 
     @Operation(summary = "按类型获取技能列表")
@@ -300,6 +377,7 @@ public class SkillController {
     @Operation(summary = "更新技能")
     @PutMapping("/{id}")
     public R<SkillEntity> update(@PathVariable Long id, @RequestBody SkillEntity skill) {
+        rejectVirtualSkillMutation(id);
         skill.setId(id);
         return R.ok(skillService.updateSkill(skill));
     }
@@ -316,6 +394,7 @@ public class SkillController {
     @Operation(summary = "硬删除技能 (admin only — 物理删除 + 工作区清空)")
     @DeleteMapping("/{id}")
     public R<Void> delete(@PathVariable Long id) {
+        rejectVirtualSkillMutation(id);
         skillService.hardDeleteSkill(id);
         return R.ok();
     }
@@ -323,6 +402,7 @@ public class SkillController {
     @Operation(summary = "启用/禁用技能")
     @PutMapping("/{id}/toggle")
     public R<SkillEntity> toggle(@PathVariable Long id, @RequestParam boolean enabled) {
+        rejectVirtualSkillMutation(id);
         return R.ok(skillService.toggleSkill(id, enabled));
     }
 

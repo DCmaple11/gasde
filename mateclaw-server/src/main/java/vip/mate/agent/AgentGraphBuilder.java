@@ -131,8 +131,11 @@ public class AgentGraphBuilder {
     private final vip.mate.llm.failover.ProviderHealthTracker providerHealthTracker;
     private final vip.mate.llm.chatmodel.ProviderChatModelFactory chatModelFactory;
     private final vip.mate.llm.failover.AvailableProviderPool providerPool;
+    private final vip.mate.tool.document.GeneratedFileCache generatedFileCache;
     /** PR-0b: DashScope-specific construction lives here now; we only call into it for the search-on log. */
     private final vip.mate.agent.chatmodel.AgentDashScopeChatModelBuilder dashScopeBuilder;
+    private final vip.mate.llm.routing.MultimodalRouter multimodalRouter;
+    private final vip.mate.llm.routing.MediaCaptionService mediaCaptionService;
 
     /**
      * Optional audit pipeline. Setter injection (rather than a constructor
@@ -293,6 +296,11 @@ public class AgentGraphBuilder {
         agent.modelCapabilities = modelCapabilityService.resolve(
                 runtimeModel.getModelName(), runtimeModel.getModalities());
         agent.runtimeProviderId = provider != null ? provider.getProviderId() : "";
+        agent.runtimeModelConfig = runtimeModel;
+        agent.toolSet = toolSet;
+        agent.multimodalRouter = multimodalRouter;
+        agent.mediaCaptionService = mediaCaptionService;
+        agent.userLocale = resolveLocale();
         agent.temperature = runtimeModel.getTemperature();
         agent.maxTokens = runtimeModel.getMaxTokens();
         agent.maxInputTokens = runtimeModel.getMaxInputTokens();
@@ -450,6 +458,8 @@ public class AgentGraphBuilder {
                     // 丢这个键，evidence_insufficient 检查会"静默地不生效" ——
                     // StateKeyRegistrationCoverageTest 专门兜这条。
                     .addStrategy(MateClawStateKeys.SOURCE_EVIDENCE_LEDGER, KeyStrategy.REPLACE)
+                    // Multimodal sidecar routing decision for the current turn.
+                    .addStrategy(MateClawStateKeys.ROUTING_DECISION, KeyStrategy.REPLACE)
                     .build();
 
             // Graph 拓扑：
@@ -556,7 +566,7 @@ public class AgentGraphBuilder {
             ObservationNode observationNode = new ObservationNode(observationProcessor, streamTracker);
             SummarizingNode summarizingNode = new SummarizingNode(chatModel, streamingHelper, streamTracker);
             LimitExceededNode limitExceededNode = new LimitExceededNode(chatModel, observationProcessor, streamingHelper, i18nService);
-            FinalAnswerNode finalAnswerNode = new FinalAnswerNode();
+            FinalAnswerNode finalAnswerNode = new FinalAnswerNode(generatedFileCache);
 
             KeyStrategyFactory keyStrategyFactory = KeyStrategy.builder()
                     // 输入字段
@@ -636,6 +646,8 @@ public class AgentGraphBuilder {
                     // 丢这个键，evidence_insufficient 检查会"静默地不生效" ——
                     // StateKeyRegistrationCoverageTest 专门兜这条。
                     .addStrategy(MateClawStateKeys.SOURCE_EVIDENCE_LEDGER, KeyStrategy.REPLACE)
+                    // Multimodal sidecar routing decision for the current turn.
+                    .addStrategy(MateClawStateKeys.ROUTING_DECISION, KeyStrategy.REPLACE)
                     .build();
 
             StateGraph graph = new StateGraph("react-agent-v2", keyStrategyFactory)
@@ -699,6 +711,21 @@ public class AgentGraphBuilder {
      */
     public ChatModel buildRuntimeChatModel(ModelConfigEntity runtimeModel) {
         return buildRuntimeChatModel(runtimeModel, this.retryTemplate);
+    }
+
+    /**
+     * Resolve the user-facing locale used for sidecar caption prompts.
+     * Reads {@code language} from system settings; falls back to
+     * {@code zh-CN} so CN deployments stay consistent with the chat UI.
+     */
+    private java.util.Locale resolveLocale() {
+        try {
+            String lang = systemSettingService.getLanguage();
+            if (lang == null || lang.isBlank()) return java.util.Locale.SIMPLIFIED_CHINESE;
+            return java.util.Locale.forLanguageTag(lang);
+        } catch (Exception e) {
+            return java.util.Locale.SIMPLIFIED_CHINESE;
+        }
     }
 
     /**
@@ -1584,6 +1611,7 @@ public class AgentGraphBuilder {
     private RestClient.Builder applyHttpTimeouts(RestClient.Builder builder, Integer readTimeoutOverride) {
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(vip.mate.llm.chatmodel.HttpTimeouts.CONNECT_TIMEOUT)
+                .version(HttpClient.Version.HTTP_1_1)
                 .build();
         JdkClientHttpRequestFactory rf = new JdkClientHttpRequestFactory(httpClient);
         rf.setReadTimeout(vip.mate.llm.chatmodel.HttpTimeouts.resolveReadTimeout(readTimeoutOverride));
@@ -1614,8 +1642,13 @@ public class AgentGraphBuilder {
      * {@link #applyHttpTimeouts(RestClient.Builder, Integer)}.
      */
     private WebClient.Builder applyHttpTimeoutsToWebClient(WebClient.Builder builder, Integer readTimeoutOverride) {
+        // Pin HTTP/1.1: many self-hosted OpenAI-compatible servers (vLLM, lmstudio,
+        // llama.cpp, ollama — all uvicorn/ASGI based) only speak HTTP/1.1 over
+        // cleartext and slam the socket on the JDK client's default H2C upgrade
+        // probe, surfacing as "header parser received no bytes" with no body sent.
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(vip.mate.llm.chatmodel.HttpTimeouts.CONNECT_TIMEOUT)
+                .version(HttpClient.Version.HTTP_1_1)
                 .build();
         org.springframework.http.client.reactive.JdkClientHttpConnector connector =
                 new org.springframework.http.client.reactive.JdkClientHttpConnector(httpClient);

@@ -1416,6 +1416,14 @@ public class ChatController {
         payload.put("status", status);
         if (savedAssistant != null && savedAssistant.getId() != null) {
             payload.put("assistantMessageId", savedAssistant.getId());
+            // Surface runtime model attribution so the chat bubble can show
+            // which model produced this reply without waiting for a history reload.
+            if (savedAssistant.getRuntimeModel() != null && !savedAssistant.getRuntimeModel().isBlank()) {
+                payload.put("runtimeModel", savedAssistant.getRuntimeModel());
+            }
+            if (savedAssistant.getRuntimeProvider() != null && !savedAssistant.getRuntimeProvider().isBlank()) {
+                payload.put("runtimeProvider", savedAssistant.getRuntimeProvider());
+            }
         }
         if (promptTokens > 0) payload.put("promptTokens", promptTokens);
         if (completionTokens > 0) payload.put("completionTokens", completionTokens);
@@ -1638,10 +1646,26 @@ public class ChatController {
          * having to guess from text. Empty string until the event arrives.
          */
         private String finishReason = "";
+        /**
+         * Recovery affordance payload from {@link
+         * vip.mate.agent.GraphEventPublisher#feedback}. Persisted into
+         * {@code metadata.feedbackEvent} so a page reload still surfaces
+         * the retry/regenerate/report card on the failed assistant
+         * bubble. Null when the turn ended cleanly.
+         */
+        private Map<String, Object> feedbackEvent = null;
         private Long planId = null;
         private List<String> planSteps = List.of();
         private Integer currentPlanStep = null;
         private Map<String, Object> pendingApproval = null;
+        /**
+         * Multimodal sidecar routing decision for this turn (null when no
+         * routing happened). Captured from the {@code _routing_decision}
+         * event emitted before the graph stream and folded into
+         * {@code metadata.routing} on persistence so the chat UI can show
+         * which sidecar (if any) was invoked.
+         */
+        private Map<String, Object> routingDecision = null;
 
         synchronized void accept(AgentService.StreamDelta delta, String conversationId) {
             if (delta == null) return;
@@ -1674,6 +1698,22 @@ public class ChatController {
                         // persisted with the assistant message.
                         finishReason = String.valueOf(reason);
                     }
+                }
+                if (vip.mate.agent.GraphEventPublisher.EVENT_FEEDBACK
+                        .equals(delta.eventType())) {
+                    // Snapshot the affordance payload so it persists into
+                    // message metadata. The same event is also rebroadcast
+                    // live (via the broadcastEvent fall-through below) so
+                    // an already-mounted UI sees it instantly without
+                    // waiting for the message-save round trip.
+                    feedbackEvent = delta.eventData();
+                }
+                if (vip.mate.agent.GraphEventPublisher.EVENT_ROUTING_DECISION.equals(delta.eventType())) {
+                    // Captured at turn start; persisted under metadata.routing so the
+                    // chat UI can render which sidecar (if any) was invoked. Internal
+                    // event — return early to skip rebroadcast on IM channels.
+                    routingDecision = delta.eventData();
+                    return;
                 }
                 accumulateToolEvent(delta.eventType(), delta.eventData(), conversationId);
                 try {
@@ -1958,6 +1998,18 @@ public class ChatController {
                     // turns from long-term memory promotion) instead of doing
                     // brittle text matching on the assistant content.
                     metadata.put("finishReason", finishReason);
+                }
+                if (feedbackEvent != null && !feedbackEvent.isEmpty()) {
+                    // Persist the recovery-affordance payload so the
+                    // retry/regenerate/report card survives page reload.
+                    // Stored as-is (errorType, errorMessage, actions,
+                    // timestamp) — frontend MessageBubble reads
+                    // metadata.feedbackEvent and renders one button per
+                    // entry in `actions`.
+                    metadata.put("feedbackEvent", feedbackEvent);
+                }
+                if (routingDecision != null && !routingDecision.isEmpty()) {
+                    metadata.put("routing", routingDecision);
                 }
                 return objectMapper.writeValueAsString(metadata);
             } catch (Exception e) {

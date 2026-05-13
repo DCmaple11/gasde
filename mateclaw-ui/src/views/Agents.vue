@@ -319,22 +319,31 @@
             </div>
             <p class="binding-hint">{{ t('agents.binding.skillsHint') }}</p>
             <div v-if="availableSkills.length === 0" class="binding-empty">{{ t('agents.binding.noSkills') }}</div>
-            <div v-else class="binding-list">
-              <label
-                v-for="skill in availableSkills"
-                :key="skill.id"
-                class="binding-item"
-                :class="{ selected: selectedSkillIds.includes(skill.id) }"
-              >
-                <input type="checkbox" :value="skill.id" v-model="selectedSkillIds" class="binding-checkbox" />
-                <span class="binding-icon"><SkillIcon :value="skill.icon" :size="20" :fallback="'🧩'" /></span>
-                <div class="binding-info">
-                  <span class="binding-name">{{ skill.name }}</span>
-                  <span v-if="skill.description" class="binding-desc">{{ skill.description?.slice(0, 80) }}</span>
-                </div>
-                <span v-if="skill.version" class="binding-version">v{{ skill.version }}</span>
-              </label>
-            </div>
+            <template v-else>
+              <div class="binding-search">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input v-model="skillBindingSearch" :placeholder="t('agents.binding.searchSkills')" />
+              </div>
+              <div v-if="filteredAvailableSkills.length === 0" class="binding-empty binding-empty--compact">{{ t('agents.binding.noMatchingSkills') }}</div>
+              <div v-else class="binding-list">
+                <label
+                  v-for="skill in filteredAvailableSkills"
+                  :key="skill.id"
+                  class="binding-item"
+                  :class="{ selected: selectedSkillIds.includes(skill.id) }"
+                >
+                  <input type="checkbox" :value="skill.id" v-model="selectedSkillIds" class="binding-checkbox" />
+                  <span class="binding-icon"><SkillIcon :value="skill.icon" :size="20" :fallback="'🧩'" /></span>
+                  <div class="binding-info">
+                    <span class="binding-name">{{ skill.name }}</span>
+                    <span v-if="skill.description" class="binding-desc">{{ skill.description?.slice(0, 80) }}</span>
+                  </div>
+                  <span v-if="skill.version" class="binding-version">v{{ skill.version }}</span>
+                </label>
+              </div>
+            </template>
           </div>
 
           <!-- Tools Tab — RFC-090 §9.2 调整 B: Advanced bypass for atomic
@@ -356,22 +365,78 @@
               </summary>
               <p class="binding-hint">{{ t('agents.binding.toolsHint') }}</p>
               <p class="binding-hint advanced-tools-note">{{ t('agents.binding.advancedToolsHint') }}</p>
-              <div v-if="availableTools.length === 0" class="binding-empty">{{ t('agents.binding.noTools') }}</div>
+              <p class="binding-hint advanced-tools-note">{{ t('agents.binding.toolUnionHint') }}</p>
+              <div v-if="availableToolGroups.length > 0" class="binding-search">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input v-model="toolBindingSearch" :placeholder="t('agents.binding.searchTools')" />
+              </div>
+              <!-- Render the empty state only when there is genuinely
+                   nothing to show. availableTools can be empty while
+                   availableToolGroups still contains a synthesized
+                   orphan group (saved bindings whose tools dropped out
+                   of the catalog) — that case must reach the list so
+                   the user can clean those orphans up. -->
+              <div v-if="availableToolGroups.length === 0" class="binding-empty">{{ t('agents.binding.noTools') }}</div>
+              <div v-else-if="filteredAvailableToolGroups.length === 0" class="binding-empty binding-empty--compact">{{ t('agents.binding.noMatchingTools') }}</div>
               <div v-else class="binding-list">
-                <label
-                  v-for="tool in availableTools"
-                  :key="tool.name"
-                  class="binding-item"
-                  :class="{ selected: selectedToolNames.includes(tool.name) }"
-                >
-                  <input type="checkbox" :value="tool.name" v-model="selectedToolNames" class="binding-checkbox" />
-                  <span class="binding-icon"><SkillIcon :value="tool.icon" :size="20" :fallback="'🔧'" /></span>
-                  <div class="binding-info">
-                    <span class="binding-name">{{ tool.displayName || tool.name }}</span>
-                    <span v-if="tool.description" class="binding-desc">{{ tool.description?.slice(0, 80) }}</span>
+                <template v-for="group in filteredAvailableToolGroups" :key="group.groupId">
+                  <div class="binding-group-header">
+                    <span>{{ group.label }}</span>
+                    <!-- MCP groups: ticking is now record-only — enabled MCP
+                         tools auto-join the agent's effective allowlist
+                         (server is admin-enabled at the system level). Tell
+                         the user that here so they don't think unchecked
+                         MCP rows are disabled. To deny a specific MCP tool,
+                         users still have Security → Tool Guard. -->
+                    <span
+                      v-if="group.groupId && group.groupId.startsWith('mcp:')"
+                      class="binding-group-note"
+                      :title="t('agents.binding.mcpAutoIncludedTooltip')"
+                    >
+                      {{ t('agents.binding.mcpAutoIncludedBadge') }}
+                    </span>
                   </div>
-                  <span class="binding-type-badge">{{ tool.toolType }}</span>
-                </label>
+                  <label
+                    v-for="tool in group.tools"
+                    :key="tool.rowId || `${group.groupId}#${tool.rawName}#${tool.name}`"
+                    class="binding-item"
+                    :class="{
+                      selected: tool._isSelected,
+                      'binding-item--stale': tool.stale,
+                      'binding-item--unavailable': !tool.available,
+                    }"
+                    :title="!tool.available
+                      ? t('agents.binding.toolUnavailableTooltip', { reason: tool.unavailableReason || '' })
+                      : (tool.stale ? t('agents.binding.toolStaleTooltip') : tool.name)"
+                  >
+                    <!-- Manual checkbox state. Two rows can share the
+                         same tool.name (hash-collision twin or
+                         duplicate-raw twin); v-model would auto-sync
+                         both, so we drive each row's checked flag from
+                         the pre-computed _isSelected derived in
+                         availableToolGroups, which considers whether
+                         this row's name is owned by a bindable twin. -->
+                    <input
+                      type="checkbox"
+                      class="binding-checkbox"
+                      :checked="tool._isSelected"
+                      :disabled="tool._isDisabled"
+                      @change="onToolToggle(tool.name, $event)"
+                    />
+                    <span class="binding-icon">
+                      <SkillIcon :value="tool.source === 'mcp' ? '🔌' : '🔧'" :size="20" :fallback="'🔧'" />
+                    </span>
+                    <div class="binding-info">
+                      <span class="binding-name">{{ tool.rawName || tool.name }}</span>
+                      <span v-if="tool.description" class="binding-desc">{{ tool.description?.slice(0, 80) }}</span>
+                    </div>
+                    <span v-if="tool.stale" class="binding-stale-badge">{{ t('agents.binding.toolStaleBadge') }}</span>
+                    <span v-if="!tool.available" class="binding-unavailable-badge">{{ t('agents.binding.toolUnavailableBadge') }}</span>
+                    <span v-else class="binding-type-badge">{{ tool.source }}</span>
+                  </label>
+                </template>
               </div>
             </details>
           </div>
@@ -439,6 +504,7 @@ import {
   type AgentPromptProfile,
 } from '@/utils/agentPromptProfile'
 import { agentIconColor } from '@/utils/agentIconColor'
+import { filterAgentBindingItems, filterAgentToolGroups } from '@/utils/agentBindingSearch'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -456,6 +522,122 @@ const advancedToolsOpen = ref(false)
 // Binding state
 const availableSkills = ref<any[]>([])
 const availableTools = ref<any[]>([])
+const skillBindingSearch = ref('')
+const toolBindingSearch = ref('')
+
+const filteredAvailableSkills = computed(() => filterAgentBindingItems(availableSkills.value, skillBindingSearch.value))
+
+/**
+ * Group the flat /tools/available payload by source so the picker
+ * renders one section per origin (built-in, MCP per server). Groups
+ * are stable in insertion order — built-in first because the API
+ * returns them first, then MCP groups in server discovery order.
+ *
+ * <p>For each row we also pre-compute {@code _isSelected} /
+ * {@code _isDisabled} so the template doesn't have to derive them from
+ * {@code tool.name} alone. With hash-collision and duplicate-raw rows
+ * sharing the same {@code name} as the bindable twin, naively using
+ * {@code selectedToolNames.includes(tool.name)} would mark both checked
+ * and let the user uncheck the unavailable one — the unchecked twin
+ * would silently mutate the bound name. The pre-computed flags decouple
+ * each row's UI state from any sibling row that shares its prefixed
+ * name.
+ */
+const availableToolGroups = computed(() => {
+  const groups: Record<string, { groupId: string; label: string; tools: any[] }> = {}
+  const order: string[] = []
+
+  // Names that any available row claims. Unavailable rows whose name is
+  // also held by an available row are "shadowed" — they must never look
+  // selected and must never accept a click. Unavailable rows whose name
+  // ISN'T in this set are orphans (e.g. a saved binding whose tool got
+  // removed upstream); the user must still be able to uncheck them.
+  const bindableNames = new Set<string>()
+  // Names that appear anywhere in availableTools (with either flag). Any
+  // entry in selectedToolNames whose name is not in this set is a
+  // "catalog-orphan" — saved before the upstream catalog dropped it —
+  // and needs a synthesized row so the user can uncheck it.
+  const knownNames = new Set<string>()
+  for (const t of availableTools.value) {
+    knownNames.add(t.name)
+    if (t.available) bindableNames.add(t.name)
+  }
+
+  for (const t of availableTools.value) {
+    const key = t.groupId || (t.source === 'mcp' ? `mcp:${t.providerId}` : 'builtin')
+    if (!groups[key]) {
+      const label = t.group || (t.source === 'mcp' ? `MCP · ${t.providerName ?? ''}` : t.source || 'tools')
+      groups[key] = { groupId: key, label, tools: [] }
+      order.push(key)
+    }
+
+    const inSelection = selectedToolNames.value.includes(t.name)
+    const isOrphanUnavailable = !t.available && !bindableNames.has(t.name)
+    // selected: only the bindable row owns the name; orphan unavailable
+    // rows reflect their own selection state so the user can clean them up.
+    const _isSelected = (t.available || isOrphanUnavailable) && inSelection
+    // disabled: shadowed rows are hard-disabled (let the bindable twin
+    // own the click); orphan unavailable rows allow only "uncheck"
+    // (currently-selected → enabled; not selected → disabled).
+    const _isDisabled = !t.available && !(isOrphanUnavailable && inSelection)
+    groups[key].tools.push({ ...t, _isSelected, _isDisabled, _isOrphanUnavailable: isOrphanUnavailable })
+  }
+
+  // Catalog-orphan synthesis: any name in the existing binding that
+  // /tools/available no longer returns at all. The backend save path
+  // permits removing such names ("keeps" don't validate), but without a
+  // visible row the user has no way to trigger the removal. Render them
+  // in their own group; uncheck removes them from selectedToolNames and
+  // the synthesized row vanishes on the next computed pass (the name is
+  // no longer in selectedToolNames).
+  const orphanNames = selectedToolNames.value.filter((n) => !knownNames.has(n))
+  if (orphanNames.length > 0) {
+    const orphanGroupId = 'orphan'
+    groups[orphanGroupId] = {
+      groupId: orphanGroupId,
+      label: t('agents.binding.toolOrphanGroup'),
+      tools: orphanNames.map((n) => ({
+        rowId: `orphan#${n}`,
+        source: 'orphan',
+        providerId: null,
+        providerName: null,
+        name: n,
+        rawName: n,
+        description: t('agents.binding.toolOrphanDescription'),
+        group: t('agents.binding.toolOrphanGroup'),
+        groupId: orphanGroupId,
+        stale: false,
+        available: false,
+        unavailableReason: 'NOT_IN_CATALOG',
+        // Always selected (it is, by definition, in selectedToolNames)
+        // and always uncheckable so the user can remove it.
+        _isSelected: true,
+        _isDisabled: false,
+        _isOrphanUnavailable: true,
+      })),
+    }
+    order.push(orphanGroupId)
+  }
+  return order.map((k) => groups[k])
+})
+
+const filteredAvailableToolGroups = computed(() => filterAgentToolGroups(availableToolGroups.value, toolBindingSearch.value))
+
+/**
+ * Manual checkbox handler — replaces v-model on the picker row so that
+ * two rows sharing a tool name (collision/duplicate twins) don't drag
+ * each other's selection state via Vue's v-model auto-sync.
+ */
+function onToolToggle(toolName: string, event: Event) {
+  const target = event.target as HTMLInputElement
+  if (target.checked) {
+    if (!selectedToolNames.value.includes(toolName)) {
+      selectedToolNames.value.push(toolName)
+    }
+  } else {
+    selectedToolNames.value = selectedToolNames.value.filter((n) => n !== toolName)
+  }
+}
 const selectedSkillIds = ref<number[]>([])
 const selectedToolNames = ref<string[]>([])
 // RFC-009 PR-3: per-agent provider preference order
@@ -599,6 +781,8 @@ function openBlankCreateModal() {
   form.value = defaultForm()
   profileForm.value = emptyProfile()
   modalTab.value = 'basic'
+  skillBindingSearch.value = ''
+  toolBindingSearch.value = ''
   selectedSkillIds.value = []
   selectedToolNames.value = []
   selectedProviderIds.value = []
@@ -648,8 +832,8 @@ async function applyTemplate(id: string) {
     ElMessage.success(t('agents.templates.applied'))
     showTemplateSelector.value = false
     await loadAgents()
-  } catch {
-    ElMessage.error(t('agents.messages.saveFailed'))
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('agents.messages.saveFailed'))
   } finally {
     applyingTemplate.value = false
   }
@@ -671,6 +855,8 @@ async function openEditModal(agent: Agent) {
   }
   profileForm.value = parsePrompt(agent.systemPrompt)
   modalTab.value = 'basic'
+  skillBindingSearch.value = ''
+  toolBindingSearch.value = ''
   showModal.value = true
 
   // Load available skills/tools/providers and current bindings in parallel
@@ -679,7 +865,10 @@ async function openEditModal(agent: Agent) {
       // RFC-042: /skills is now paginated; binding dropdown only needs enabled skills,
       // so listEnabled() is both semantically correct and shape-stable (returns array).
       skillApi.listEnabled(),
-      toolApi.list(),
+      // /tools/available aggregates built-in tools + every MCP-discovered
+      // tool grouped by server, with stale/available flags so the picker
+      // matches the runtime callback set exactly.
+      toolApi.listAvailable(),
       modelApi.listProviders(),
       agentBindingApi.listSkills(agent.id),
       agentBindingApi.listTools(agent.id),
@@ -709,6 +898,8 @@ async function openEditModal(agent: Agent) {
 function closeModal() {
   showModal.value = false
   editingAgent.value = null
+  skillBindingSearch.value = ''
+  toolBindingSearch.value = ''
 }
 
 async function saveAgent() {
@@ -740,8 +931,8 @@ async function saveAgent() {
     ElMessage.success(t('agents.messages.saveSuccess'))
     closeModal()
     await loadAgents()
-  } catch {
-    ElMessage.error(t('agents.messages.saveFailed'))
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('agents.messages.saveFailed'))
   }
 }
 
@@ -1095,6 +1286,29 @@ html.dark .live-pill {
   margin: 0;
 }
 .binding-empty { padding: 40px; text-align: center; color: var(--mc-text-tertiary); font-size: 14px; }
+.binding-empty--compact { padding: 24px 12px; }
+.binding-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--mc-border);
+  border-radius: 8px;
+  background: var(--mc-bg-sunken);
+  color: var(--mc-text-tertiary);
+}
+.binding-search svg { flex-shrink: 0; }
+.binding-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--mc-text-primary);
+  font-size: 13px;
+}
+.binding-search input::placeholder { color: var(--mc-text-tertiary); }
 .binding-list { display: flex; flex-direction: column; gap: 6px; }
 .binding-item {
   display: flex; align-items: center; gap: 10px; padding: 10px 12px;
@@ -1258,6 +1472,19 @@ html.dark .live-pill {
 .advanced-tools-count { padding: 1px 8px; background: var(--mc-primary-bg); color: var(--mc-primary); border-radius: 999px; font-size: 11px; font-weight: 700; }
 .advanced-tools-chevron { color: var(--mc-text-tertiary); font-size: 12px; }
 .advanced-tools-note { font-style: italic; color: var(--mc-text-tertiary); margin-top: 4px; }
+
+/* MCP group header: inline "auto-available" tag next to the label so users
+   know enabled MCP tools work without being ticked. */
+.binding-group-header { display: flex; align-items: center; gap: 8px; }
+.binding-group-note {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--mc-primary) 12%, transparent);
+  color: var(--mc-primary);
+  cursor: help;
+}
 
 /* Icon picker trigger — replaces the old free-text icon input. Tile shape
  * mirrors SkillMarket's identity-icon-row so the create/edit affordance

@@ -58,6 +58,13 @@ export type SSEEventType =
   | 'content_truncated'
   | 'tool_result_chunk'
   | 'delegation_batch'
+  // Recovery affordance for non-transient errors (ERROR_FALLBACK turns)
+  | 'feedback_event'
+  // Context compaction lifecycle. Fired by ConversationWindowManager
+  // around each compaction pass so the UI can show a progress chip
+  // (start → pair_safe → summarize → done/skipped/failed). Payload
+  // carries preTokens/postTokens/messagesSummarized/tailKept/etc.
+  | 'compact_status'
 
 export interface SSEEvent {
   type: SSEEventType

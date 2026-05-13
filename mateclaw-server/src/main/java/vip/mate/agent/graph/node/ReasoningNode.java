@@ -348,7 +348,12 @@ public class ReasoningNode implements NodeAction {
         }
 
         if (conversationWindowManager != null) {
-            messages = conversationWindowManager.pruneOldToolResultsForModelInput(messages);
+            // Pass conversationId + workspaceBasePath so oversized older
+            // tool results can be spilled to the workspace spill directory
+            // (preserving the full body for read_file recovery) instead of
+            // being rewritten into a lossy single-line summary.
+            messages = conversationWindowManager.pruneOldToolResultsForModelInput(
+                    messages, conversationId, workspaceBasePath);
         }
         promptMessages.addAll(messages);
 
@@ -485,6 +490,46 @@ public class ReasoningNode implements NodeAction {
                     .mergeUsage(state, result);
             if (!partialThinking.isEmpty()) {
                 builder.finalThinking(partialThinking);
+            }
+            return builder.build();
+        }
+
+        if (result.partial() && "content_repetition".equals(result.errorMessage())) {
+            // Reasoning loop: the helper disposed the stream because the
+            // model emitted the same paragraph 4+ times in a row (qwen3.6
+            // / deepseek-r1 self-arguing pattern). The streamed text
+            // already showed the duplicates to the user — we can't unsend
+            // SSE chunks — but the persisted finalAnswer should be ONE
+            // clean copy so the IM channel reply and any page-reload
+            // history don't show the wall of repetition. Skip
+            // FinalAnswerNode's evidence validation: the answer is
+            // already truncated, applying validateAnswer on top would
+            // double-stamp warnings on something the user already knows
+            // is incomplete.
+            String rawContent = result.text() != null ? result.text() : "";
+            String dedupedAnswer = NodeStreamingChatHelper.dedupTrailingRepeats(
+                    rawContent,
+                    NodeStreamingChatHelper.CONTENT_REPEAT_MIN_PERIOD,
+                    NodeStreamingChatHelper.CONTENT_REPEAT_MAX_PERIOD);
+            log.warn("[ReasoningNode] Content-repetition cap hit (raw={} chars → deduped={} chars); " +
+                            "INCOMPLETE",
+                    rawContent.length(), dedupedAnswer.length());
+            var builder = reasonOutput()
+                    .needsToolCall(false)
+                    .shouldSummarize(false)
+                    .finalAnswer(dedupedAnswer.isEmpty()
+                            ? "（模型反复输出同一段内容，已自动截断。请尝试重新生成或换个问法。）"
+                            : dedupedAnswer)
+                    .llmCallCount(nextLlmCallCount)
+                    .finishReason(FinishReason.INCOMPLETE)
+                    // contentStreamed=true because the user already saw
+                    // the looping text in their bubble; persisting again
+                    // via streamedContent would replay it.
+                    .contentStreamed(true)
+                    .thinkingStreamed(result.thinking() != null && !result.thinking().isEmpty())
+                    .mergeUsage(state, result);
+            if (result.thinking() != null && !result.thinking().isEmpty()) {
+                builder.finalThinking(result.thinking());
             }
             return builder.build();
         }
