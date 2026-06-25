@@ -1,0 +1,63 @@
+# MateClaw 桌面端 profile
+#
+# 用途：Electron 壳以子进程方式启动后端 jar 时激活本 profile
+#       （--spring.profiles.active=desktop）。
+#
+# 设计原则：
+#   - 本地优先（H2 文件库，无外部数据库依赖）
+#   - 单用户场景（连接池、内存小于服务端默认）
+#   - 关闭桌面端不需要的特性（Swagger UI、H2 控制台），减少攻击面与启动耗时
+#
+# 数据目录锚点 user.data.dir：
+#   主进程 spawn 时传入 --user.data.dir=<userData>，同时 -Duser.home=<userData>。
+#   本 profile 的所有路径占位符 ${user.data.dir:./data} 都会落到系统标准 userData 目录：
+#     Windows: %APPDATA%/MateClaw
+#     macOS:   ~/Library/Application Support/MateClaw
+#     Linux:   ~/.config/MateClaw
+#   无需新建任何 Java 配置类（零侵入）。
+
+server:
+  port: 0
+
+spring:
+  datasource:
+    url: jdbc:h2:file:${user.data.dir:./data}/mateclaw;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;AUTO_RECONNECT=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  flyway:
+    locations:
+      - classpath:db/migration/h2
+
+  h2:
+    console:
+      enabled: false
+
+mateclaw:
+  workspace:
+    sandbox:
+      root: ${user.data.dir:./data}/workspace
+  skill:
+    workspace:
+      root: ${user.data.dir:./data}/skills
+      auto-init: true
+  plugin:
+    user-dir: ${user.data.dir:./data}/plugins
+
+# 桌面端关闭 OpenAPI / Swagger UI（减少攻击面，省启动时间）
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+# 仅暴露 health 端点供 Electron 主进程做就绪探测
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

@@ -48,6 +48,7 @@ export default defineConfig({
     ],
   },
   server: {
+    host: '127.0.0.1', // 监听 IPv4，与 Electron 桌面端 dev 模式对齐（默认仅 IPv6 [::1] 会导致白屏）
     port: 5173,
     proxy: {
       '/api': {

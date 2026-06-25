@@ -7,29 +7,29 @@ services:
   #   1. cp .env.example .env
   #   2. 编辑 .env 把 DB_ROOT_PASSWORD / DB_PASSWORD 改成强密码
   # 未设置会直接在 `docker compose up` 时报错，避免把默认密码带到生产环境。
-  mysql:
-    image: mysql:8.0
-    container_name: mateclaw-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required in .env}
-      MYSQL_DATABASE: ${DB_NAME:-mateclaw}
-      MYSQL_USER: ${DB_USERNAME:-mateclaw}
-      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required in .env}
-      TZ: Asia/Shanghai
-    ports:
-      - "3306:3306"
-    volumes:
-      - mysql_data:/var/lib/mysql
-    # Schema and seed data are managed by Flyway on application startup.
-    # Do NOT mount legacy schema.sql / data.sql here — Flyway creates all
-    # tables from V1 baseline and applies incremental migrations automatically.
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+#  mysql:
+#    image: mysql:8.0
+#    container_name: mateclaw-mysql
+#    restart: unless-stopped
+#    environment:
+#      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required in .env}
+#      MYSQL_DATABASE: ${DB_NAME:-mateclaw}
+#      MYSQL_USER: ${DB_USERNAME:-mateclaw}
+#      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required in .env}
+#      TZ: Asia/Shanghai
+#    ports:
+#      - "3306:3306"
+#    volumes:
+#      - mysql_data:/var/lib/mysql
+#    # Schema and seed data are managed by Flyway on application startup.
+#    # Do NOT mount legacy schema.sql / data.sql here — Flyway creates all
+#    # tables from V1 baseline and applies incremental migrations automatically.
+#    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+#    healthcheck:
+#      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
 
   # SearXNG 搜索引擎（keyless 搜索 provider）
   #
@@ -48,7 +48,7 @@ services:
       - UWSGI_WORKERS=2
       - UWSGI_THREADS=4
     ports:
-      - "8088:8080"
+      - "8089:8080"
     healthcheck:
       # Healthz needs json format, so this also doubles as an integration check.
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/healthz"]
@@ -66,13 +66,13 @@ services:
     container_name: mateclaw-server
     restart: unless-stopped
     depends_on:
-      mysql:
-        condition: service_healthy
+#      mysql:
+#        condition: service_healthy
       searxng:
         condition: service_healthy
     environment:
       SPRING_PROFILES_ACTIVE: mysql
-      DB_HOST: mysql
+      DB_HOST: 127.0.0.1
       DB_PORT: 3306
       DB_NAME: ${DB_NAME:-mateclaw}
       DB_USERNAME: ${DB_USERNAME:-mateclaw}

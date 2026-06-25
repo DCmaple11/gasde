@@ -1,0 +1,31 @@
+{
+  "name": "mateclaw-desktop",
+  "version": "1.6.0",
+  "description": "MateClaw desktop shell — wraps the Spring Boot backend jar in an Electron app with a bundled JRE.",
+  "private": true,
+  "author": "MateClaw",
+  "license": "Apache-2.0",
+  "main": "dist-electron/electron/main/index.js",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:ts": "tsc -p tsconfig.json",
+    "clean": "node -e \"fs.rmSync('dist-electron',{recursive:true,force:true})\"",
+    "dev": "node scripts/dev.js",
+    "dev:prod": "node scripts/dev.js --prod",
+    "build:electron": "npm run build:ts && electron-builder",
+    "build:win": "npm run build:ts && electron-builder --win",
+    "build:mac": "npm run build:ts && electron-builder --mac",
+    "build:linux": "npm run build:ts && electron-builder --linux",
+    "build:desktop": "node scripts/build-desktop.js",
+    "download:jre": "node scripts/download-jre.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "electron": "^31.0.0",
+    "electron-builder": "^25.0.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.0"
+  }
+}
