@@ -56,14 +56,12 @@
   },
   "mac": {
     "target": [
-      { "target": "dmg", "arch": ["x64", "arm64"] },
-      { "target": "zip", "arch": ["x64", "arm64"] }
+      { "target": "dmg", "arch": ["arm64"] },
+      { "target": "zip", "arch": ["arm64"] }
     ],
-    "icon": "build/icon.icns",
-    "hardenedRuntime": true,
-    "gatekeeperAssess": false,
-    "entitlements": "build/entitlements.mac.plist",
-    "entitlementsInherit": "build/entitlements.mac.plist"
+    "icon": "build/icon.png",
+    "hardenedRuntime": false,
+    "gatekeeperAssess": false
   },
   "linux": {
     "target": [
@@ -71,10 +69,5 @@
     ],
     "icon": "build/icon.png",
     "category": "Office"
-  },
-  "publish": {
-    "provider": "github",
-    "owner": "matevip",
-    "repo": "mateclaw"
   }
 }
