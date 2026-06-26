@@ -1,0 +1,125 @@
+# OpenClawMax 桌面端 CI —— 三平台矩阵构建。
+#
+# 触发：
+#   - 打 tag v* 自动构建并发布到 GitHub Release
+#   - workflow_dispatch 手动触发（仅构建，不发布）
+#
+# 不签名：Windows 会弹 SmartScreen 警告（用户点「仍要运行」即可）；
+# macOS 不签名+不公证会被 Gatekeeper 拦截，用户需右键→打开，或正式分发前补签名公证。
+#
+# 每个平台的 runner 只构建自己平台的包（mac dmg 必须 macOS，win nsis 必须 Windows）。
+
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '构建并发布到 Release（仅 tag 触发时生效）'
+        required: false
+        default: 'false'
+
+# 同一 tag 多次推送只跑最新一次
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false  # 一个平台失败不影响其他平台继续
+      matrix:
+        include:
+          - os: windows-latest
+            target: win
+            artifact: 'OpenClawMax Setup *.exe'
+          - os: macos-latest
+            target: mac
+            artifact: 'OpenClawMax-*.dmg'
+          - os: ubuntu-latest
+            target: linux
+            artifact: 'OpenClawMax-*.AppImage'
+
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: mateclaw-ui/pnpm-lock.yaml
+
+      # Maven 依赖缓存（首次冷构建 5-10 分钟，缓存后 1-2 分钟）
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ matrix.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: m2-${{ matrix.os }}-
+
+      # JRE 缓存：每平台各下自己的 JRE（~50MB），按 os 缓存避免重复下载
+      - name: Cache JRE
+        id: cache-jre
+        uses: actions/cache@v4
+        with:
+          path: mateclaw-desktop/resources/jre
+          key: jre-21-${{ matrix.target }}-${{ runner.os }}
+
+      - name: Install desktop deps
+        working-directory: mateclaw-desktop
+        run: npm install
+
+      # 一键编排：前端 build:desktop + 后端 jar + 拷贝 + （若 JRE 未缓存则下载）+ electron-builder
+      - name: Build desktop installer
+        working-directory: mateclaw-desktop
+        run: npm run build:desktop
+        env:
+          # CI 上 JRE 已缓存时，build-desktop 的 step4 会检测到 jre 存在并跳过下载
+          # 不签名：留空即可，electron-builder 自动跳过签名
+          CSC_LINK: ''
+          CSC_KEY_PASSWORD: ''
+          # GitHub Token：electron-builder publish 用（仅 tag 触发时实际发布）
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 上传构建产物（每个平台作为独立 artifact，便于下载验证）
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: mateclaw-desktop/release/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # 发布到 GitHub Release（仅 tag 触发时）
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mateclaw-desktop/release/${{ matrix.artifact }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
