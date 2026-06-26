@@ -111,22 +111,26 @@ function extractTarGz(file, dest) {
   if (r.status !== 0) throw new Error('tar 解压失败（macOS/Linux 应自带 tar；CI 需确保安装）');
 }
 
-// 找到解压后的 JDK/JRE 根目录（可能叫 jdk-21... 或含 Contents/Home）
+// 找到解压后的 JDK/JRE 根目录（含 bin/）。
+// 三种实际结构：
+//   1. Windows/Linux: 解压出单一目录 <name>/bin/         （bin 直接在顶层目录下）
+//   2. macOS 旧包:    <name>.jdk/Contents/Home/bin/      （bundle 带 .jdk 后缀）
+//   3. macOS 新包:    <name>-jre/Contents/Home/bin/      （Temurin，目录名无 .jdk 后缀！）
 function findHome(extractRoot) {
   const entries = fs.readdirSync(extractRoot).filter((e) => !e.startsWith('.'));
-  // macOS bundle: <name>.jdk/Contents/Home
-  const macBundle = entries.find((e) => e.endsWith('.jdk'));
-  if (macBundle) {
-    const home = path.join(extractRoot, macBundle, 'Contents', 'Home');
-    if (fs.existsSync(path.join(home, 'bin'))) return home;
+
+  // 情况 2/3：macOS bundle —— 任何顶层子目录下有 Contents/Home/bin 都算
+  for (const e of entries) {
+    const macHome = path.join(extractRoot, e, 'Contents', 'Home');
+    if (fs.existsSync(path.join(macHome, 'bin'))) return macHome;
   }
-  // 其他：解压出单一目录，其下即 bin
+  // 情况 1：顶层子目录直接含 bin
   for (const e of entries) {
     if (fs.existsSync(path.join(extractRoot, e, 'bin'))) {
       return path.join(extractRoot, e);
     }
   }
-  // 根目录本身就是 home
+  // 兜底：extractRoot 本身就是 home
   if (fs.existsSync(path.join(extractRoot, 'bin'))) return extractRoot;
   throw new Error('解压后未找到 JRE 根（含 bin）');
 }
