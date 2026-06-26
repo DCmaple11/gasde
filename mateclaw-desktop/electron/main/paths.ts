@@ -15,9 +15,10 @@ const isPackaged = (): boolean =>
   app.isPackaged || !!process.resourcesPath;
 
 // userData —— 系统标准数据目录，作为 H2/skill/workspace 的根。
-//   Windows: %APPDATA%/MateClaw
-//   macOS:   ~/Library/Application Support/MateClaw
-//   Linux:   ~/.config/MateClaw
+// 目录名由 electron-builder.json 的 productName 决定（OpenClawMax）。
+//   Windows: %APPDATA%/OpenClawMax
+//   macOS:   ~/Library/Application Support/OpenClawMax
+//   Linux:   ~/.config/OpenClawMax
 export const getUserDataDir = (): string => app.getPath('userData');
 
 // 后端日志目录（userData/logs）
@@ -49,3 +50,18 @@ export function getJavaPath(): string {
 }
 
 export const isProdPackaged = isPackaged;
+
+/**
+ * 解析 extraResources 里的资源路径（图标等）。
+ * extraResources 配置把 build/ 下的图标打到 resources/<subdir>/<file>。
+ * 打包后从 process.resourcesPath 读；开发态从 build/ 读。
+ *
+ * @param subdir extraResources 里的目标子目录（如 'tray'）
+ * @param file   文件名（如 'tray.ico'、'icon.png'）
+ */
+export function resolveResourcePath(subdir: string, file: string): string {
+  if (isPackaged()) {
+    return path.join(process.resourcesPath, subdir, file);
+  }
+  return path.join(__dirname, '..', '..', 'build', file);
+}

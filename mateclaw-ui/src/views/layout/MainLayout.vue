@@ -10,11 +10,11 @@
       <!-- Logo -->
       <div class="sidebar-logo">
         <div class="logo-icon">
-          <img src="/logo/mateclaw_logo_s.png" alt="MateClaw" class="logo-img" />
+          <img src="/logo/mateclaw_logo_s.png" alt="OpenClawMax" class="logo-img" />
         </div>
         <transition name="fade">
           <div v-if="!effectiveCollapsed" class="logo-text">
-            <span class="logo-name">Mate<span class="logo-name-highlight">Claw</span></span>
+            <span class="logo-name">OpenClaw<span class="logo-name-highlight">Max</span></span>
             <span class="logo-version">v{{ appVersion }}</span>
           </div>
         </transition>
@@ -189,7 +189,7 @@
             <line x1="3" y1="18" x2="21" y2="18"/>
           </svg>
         </button>
-        <span class="mobile-topbar-title">Mate<span class="logo-name-highlight">Claw</span></span>
+        <span class="mobile-topbar-title">OpenClaw<span class="logo-name-highlight">Max</span></span>
       </div>
       <!-- RFC-074 PR-1 fix: include route.path in the key so two different
            keepAlive routes (e.g. /channels and /settings/models) don't collide

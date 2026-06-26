@@ -1,6 +1,6 @@
 export default {
   app: {
-    title: 'MateClaw - AI 助手',
+    title: 'OpenClawMax - AI 助手',
   },
   common: {
     save: '保存',
@@ -583,7 +583,7 @@ export default {
     modelDesc: '管理模型预设与默认模型选择',
     systemTitle: '系统设置',
     systemDesc: '语言与运行行为配置',
-    aboutTitle: '关于 MateClaw',
+    aboutTitle: '关于 OpenClawMax',
     aboutDesc: '版本与系统信息',
     about: {
       heroDesc: '一套个人 AI 操作系统，让模型真正进入上下文、记忆、执行、知识和交付的连续流程。',
@@ -752,7 +752,7 @@ export default {
       claudeCodeOauthDetect: '检测 Claude Code 登录态',
       claudeCodeOauthHint: '复用本地 Claude Code Pro/Max 订阅。请先在 Claude Code 客户端中登录，再点击"检测"读取凭据。',
       claudeCodeOauthInstructions: '未检测到 Claude Code 凭据。请安装 Claude Code 客户端，使用 Pro/Max 账号登录后再点击检测。',
-      claudeCodeOauthRevokeHint: '请在 Claude Code 客户端中退出登录。MateClaw 不会修改 Claude Code 的本地凭据。',
+      claudeCodeOauthRevokeHint: '请在 Claude Code 客户端中退出登录。OpenClawMax 不会修改 Claude Code 的本地凭据。',
       providerIdPlaceholder: '例如：my-local-gemma',
       providerIdHint: 'ID 仅作内部 key 使用，建议小写英文/数字，可含 . _ -，不要含斜杠或空格（创建后不可修改）。',
       providerIdInvalid: 'Provider ID 只能包含字母、数字、点、下划线、连字符（不允许斜杠或空格），首字符必须是字母或数字，长度 1-64。',
@@ -1698,7 +1698,7 @@ export default {
       hints: {
         anthropic: 'Anthropic API key（sk-ant-…）。申请: https://console.anthropic.com/settings/keys',
         openai: 'OpenAI API key（sk-…）。申请: https://platform.openai.com/api-keys',
-        dashscope: '阿里云 DashScope key — 跟 MateClaw .env 里的 DASHSCOPE_API_KEY 同一个值',
+        dashscope: '阿里云 DashScope key — 跟 OpenClawMax .env 里的 DASHSCOPE_API_KEY 同一个值',
         google: 'Google AI Studio API key。申请: https://aistudio.google.com/apikey',
         claudeOauth: '注意: claude-code 的 OAuth 登录（~/.claude/ 里那个）在这里不能用——更糟的是 Claude Agent SDK 会"优先读 OAuth、再读 API key"，导致你下面填的 key 被静默忽略。如果你这台机器上跑过 `claude login`，先清钥匙串: (macOS) `claude logout` 或 `security delete-generic-password -s "Claude Code-credentials"`；(Linux/Windows) 删 ~/.claude/credentials.json。然后再回来填真正的 API key（sk-ant-…）。或者改用 qwen-code / opencode 复用各自 CLI 的本地登录态。',
       },
@@ -3094,7 +3094,7 @@ export default {
     kicker: 'AI Operating System',
     subtitle: '你的智能 AI 助手',
     heroTitle: '让 AI 不止会回答，而是真正进入持续工作的系统。',
-    heroDesc: 'MateClaw 的重点不是把更多能力堆进聊天框，而是把上下文、知识、执行和记忆收拢成一个可靠的工作面。',
+    heroDesc: 'OpenClawMax 的重点不是把更多能力堆进聊天框，而是把上下文、知识、执行和记忆收拢成一个可靠的工作面。',
     pointContext: '上下文保持连续',
     pointKnowledge: '知识被组织起来',
     pointExecution: '能力真正能执行',
@@ -3400,7 +3400,7 @@ export default {
       authFailed: '授权失败',
     },
     webHint: 'Web 渠道使用内置 SSE 通信，无需额外配置。',
-    webchatHint: 'Web / API 接入既可把 MateClaw 聊天挂件嵌入外部网站，也可作为纯后端 SSE 接口直接调用。配置 API Key 后，前端可引入 WebChat SDK；后端可直接 POST /api/v1/channels/webchat/stream，头带 X-MC-Key、体传 {message, visitorId, 可选 sessionId/agentId}。',
+    webchatHint: 'Web / API 接入既可把 OpenClawMax 聊天挂件嵌入外部网站，也可作为纯后端 SSE 接口直接调用。配置 API Key 后，前端可引入 WebChat SDK；后端可直接 POST /api/v1/channels/webchat/stream，头带 X-MC-Key、体传 {message, visitorId, 可选 sessionId/agentId}。',
     webchatApiKeyGenerated: '保存后平台会自动生成 API Key。创建完成后返回此页面即可复制。',
     webchatApiKeyReadOnly: '该 API Key 由平台自动生成并托管，你只能复制，不能手动修改。',
     webhookHint: 'Webhook 渠道配置请在下方「原始 JSON」标签页中编辑。',
@@ -3928,7 +3928,7 @@ export default {
     loadFailed: '加载技能管家状态失败',
   },
   onboarding: {
-    title: '欢迎使用 MateClaw',
+    title: '欢迎使用 OpenClawMax',
     subtitle: '配置你的第一个 AI 模型',
     stepPath: '选择方式',
     stepConfigure: '配置模型',
@@ -3950,7 +3950,7 @@ export default {
     verifyTitle: '验证你的模型',
     verifyMessage: '你好！简单介绍一下你自己。',
     send: '发送',
-    startUsing: '开始使用 MateClaw',
+    startUsing: '开始使用 OpenClawMax',
     skip: '跳过',
     back: '返回',
   },
@@ -4160,7 +4160,6 @@ export default {
     extract_pdf_text: '提取 PDF 内容',
     extract_docx_text: '提取文档内容',
     detect_file_type: '识别文件类型',
-    readMateClawDoc: '查阅系统文档',
 
     // Generative
     image_generate: '生成图片',

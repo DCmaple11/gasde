@@ -210,7 +210,7 @@ function reportFatal(message: string): void {
   const detail = `${message}\n\n===== 后端日志尾部 =====\n${readLogTail(2048)}`;
   writeLog(`FATAL: ${message}`);
   try {
-    dialog.showErrorBox('MateClaw 后端启动失败', detail);
+    dialog.showErrorBox('OpenClawMax 后端启动失败', detail);
   } catch {
     // 非 GUI 上下文（如打包前的单元测试）忽略
   }

@@ -106,7 +106,7 @@ const editorOptions = {
 const WORKFLOW_SCHEMA = {
   $id: 'mateclaw://workflow.schema.json',
   $schema: 'http://json-schema.org/draft-07/schema#',
-  title: 'MateClaw Workflow',
+  title: 'OpenClawMax Workflow',
   type: 'object',
   required: ['steps'],
   properties: {

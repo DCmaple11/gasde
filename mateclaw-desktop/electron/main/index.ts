@@ -6,11 +6,13 @@
 //
 // 退出时杀掉后端进程树（backend.killBackend），确保无残留 java 进程。
 
-import { app, BrowserWindow, dialog, shell } from 'electron';
+import { app, BrowserWindow, Menu, dialog, shell } from 'electron';
 import http from 'node:http';
 import path from 'node:path';
 import { isDev, DEV_FRONTEND_URL, DEV_BACKEND_PORT } from '../common/env';
 import { startBackend, killBackend } from './backend';
+import { createTray, handleClose, getIsQuitting, setIsQuitting, destroyTray } from './tray';
+import { resolveResourcePath } from './paths';
 import { writeLog } from './logger';
 
 let mainWindow: BrowserWindow | null = null;
@@ -42,6 +44,12 @@ async function bootstrap(): Promise<void> {
   }
 
   mainWindow = createWindow();
+
+  // 移除默认应用菜单栏（File/Edit/View/Window/Help）—— 现代桌面应用习惯
+  Menu.setApplicationMenu(null);
+
+  // 创建系统托盘（点 X 最小化到托盘，后端继续运行）
+  createTray(() => mainWindow);
 
   // 加载失败不能静默 —— 否则只剩白屏无从排查
   try {
@@ -96,7 +104,8 @@ function createWindow(): BrowserWindow {
     minHeight: 720,
     show: false,
     backgroundColor: '#1a1a1a',
-    title: 'MateClaw',
+    title: 'OpenClawMax',
+    icon: resolveResourcePath('tray', 'icon.png'),  // 窗口左上角 + 任务栏都用这个 logo
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       contextIsolation: true,
@@ -130,21 +139,49 @@ function createWindow(): BrowserWindow {
     return { action: 'deny' };
   });
 
+  // 拦截关闭：点 X → 最小化到托盘（后端继续运行）；只有真退出（托盘菜单）才放行
+  win.on('close', (e) => {
+    if (handleClose(() => mainWindow)) {
+      e.preventDefault(); // 已拦截为最小化，阻止真正关闭
+    }
+  });
+
   return win;
 }
 
 // ---- 生命周期绑定 ----
 
-app.whenReady().then(bootstrap);
+// 单实例锁：托盘应用必须。否则用户二次启动会再 spawn 一个后端（端口冲突 + H2 文件锁）。
+// 第二实例直接聚焦已有窗口，不重复启动。
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    // 用户再次打开 → 恢复并聚焦已有窗口
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+  app.whenReady().then(bootstrap);
+}
 
 app.on('before-quit', () => {
+  // before-quit 触发说明是真退出（托盘菜单调用 app.quit，或系统关机等）
+  setIsQuitting(true);
   writeLog('app before-quit: kill backend');
   killBackend();
+  destroyTray();
 });
 
 app.on('window-all-closed', () => {
-  // 桌面端所有平台都直接退出（P0 不做托盘驻留，P5 再加）
-  app.quit();
+  // 有托盘驻留：所有窗口关闭不应退出应用（除非正在真退出）。
+  // macOS 原生如此；Windows/Linux 配合托盘也保持后台运行。
+  if (getIsQuitting()) {
+    app.quit();
+  }
 });
 
 // 兜底：进程退出时确保后端被杀

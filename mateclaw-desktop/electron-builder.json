@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
-  "appId": "vip.mate.mateclaw",
-  "productName": "MateClaw",
-  "copyright": "Copyright © MateClaw",
+  "appId": "vip.mate.openclawmax",
+  "productName": "OpenClawMax",
+  "copyright": "Copyright © OpenClawMax",
   "directories": {
     "output": "release",
     "buildResources": "build"
@@ -22,6 +22,21 @@
       "from": "resources/jre",
       "to": "jre",
       "filter": ["**/*"]
+    },
+    {
+      "from": "build/tray.ico",
+      "to": "tray/tray.ico",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "build/tray.png",
+      "to": "tray/tray.png",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "build/icon.png",
+      "to": "tray/icon.png",
+      "filter": ["**/*"]
     }
   ],
   "asar": true,
@@ -37,7 +52,7 @@
     "allowToChangeInstallationDirectory": true,
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
-    "shortcutName": "MateClaw"
+    "shortcutName": "OpenClawMax"
   },
   "mac": {
     "target": [

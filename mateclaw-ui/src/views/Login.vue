@@ -2,8 +2,8 @@
   <div class="login-page">
     <div class="login-center">
       <div class="login-logo">
-        <img src="/logo/mateclaw_logo_s.png" alt="MateClaw" class="logo-image" />
-        <h1 class="logo-title">Mate<span class="logo-title-highlight">Claw</span></h1>
+        <img src="/logo/mateclaw_logo_s.png" alt="OpenClawMax" class="logo-image" />
+        <h1 class="logo-title">OpenClaw<span class="logo-title-highlight">Max</span></h1>
       </div>
 
       <form class="login-form" @submit.prevent="handleLogin">
