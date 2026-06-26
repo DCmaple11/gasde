@@ -43,7 +43,13 @@ function step1_buildUi() {
 
 function step2_buildJar() {
   console.log('\n=== 步骤 2/5: 构建后端 jar ===');
-  run('mvn', ['-q', 'clean', 'package', '-DskipTests'], { cwd: SERVER_DIR });
+  // 必须从仓库根目录构建：mateclaw-server 依赖兄弟模块 mateclaw-plugin-api，
+  // 单独在 server 目录跑 mvn 会找不到未 install 的 plugin-api（CI 全新环境尤甚）。
+  // -pl mateclaw-server 只构建 server；-am (also-make) 自动先构建其依赖的 plugin-api。
+  // 不加 -Paliyun-first：那是国内本地网络加速用的 profile，CI（海外 runner）走默认
+  // Maven Central 更快更稳。如本地需加速，手动 MAVEN_FLAGS=-Paliyun-first 环境变量传入。
+  const mavenFlags = process.env.MAVEN_FLAGS ? [process.env.MAVEN_FLAGS] : [];
+  run('mvn', ['-q', 'clean', 'package', '-DskipTests', '-pl', 'mateclaw-server', '-am', ...mavenFlags], { cwd: ROOT });
 }
 
 function step3_copyJar() {
