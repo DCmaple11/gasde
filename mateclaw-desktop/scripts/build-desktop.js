@@ -97,7 +97,10 @@ function step5_buildInstaller() {
     linux: '--linux',
   }[process.platform];
   run('npm', ['run', 'build:ts'], { cwd: DESKTOP_DIR });
-  run('npx', ['electron-builder', platformFlag].filter(Boolean), { cwd: DESKTOP_DIR });
+  // --publish never：CI 环境下 electron-builder 会自动尝试检测仓库做发布，
+  // 没 repository 信息会报错 "Cannot detect repository"。这里明确禁用自动发布，
+  // 发布由 CI workflow 的 softprops/action-gh-release 步骤单独负责。
+  run('npx', ['electron-builder', platformFlag, '--publish', 'never'].filter(Boolean), { cwd: DESKTOP_DIR });
   console.log('\n[build-desktop] 完成。产物位于: mateclaw-desktop/release/');
 }
 
