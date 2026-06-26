@@ -1,13 +1,18 @@
 # OpenClawMax 桌面端 CI —— 三平台矩阵构建。
 #
 # 触发：
-#   - 打 tag v* 自动构建并发布到 GitHub Release
-#   - workflow_dispatch 手动触发（仅构建，不发布）
+#   - 打 tag v* 自动构建（三平台全跑）并发布到 GitHub Release
+#   - workflow_dispatch 手动触发：可选构建单个平台（all/win/mac/linux），默认不发布
 #
 # 不签名：Windows 会弹 SmartScreen 警告（用户点「仍要运行」即可）；
 # macOS 不签名+不公证会被 Gatekeeper 拦截，用户需右键→打开，或正式分发前补签名公证。
 #
 # 每个平台的 runner 只构建自己平台的包（mac dmg 必须 macOS，win nsis 必须 Windows）。
+#
+# 平台过滤的实现：
+#   job 级 if 在 matrix 展开前求值，不能引用 matrix.*（会报 Unrecognized named-value）。
+#   所以用「动态矩阵」—— prepare job 根据 input 算出 matrix JSON，build job 消费它。
+#   这样只启动选中平台的 job，未选的不会启动 runner（不浪费额度）。
 
 name: Desktop Release
 
@@ -17,34 +22,84 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      publish:
-        description: '构建并发布到 Release（仅 tag 触发时生效）'
-        required: false
-        default: 'false'
+      platform:
+        description: '构建平台（all=三平台；或单独选 win/mac/linux）'
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - win
+          - mac
+          - linux
 
 # 同一 tag 多次推送只跑最新一次
 concurrency:
   group: desktop-release-${{ github.ref }}
   cancel-in-progress: true
 
+# 三平台完整定义（供 prepare 选取）
+#   target   : electron-builder 平台标识 + artifact 命名
+#   os       : runner 系统（mac dmg 必须 macOS，win nsis 必须 Windows）
+#   artifact : 产物的 glob
+env:
+  ALL_PLATFORMS: >-
+    [
+      {"target":"win","os":"windows-latest","artifact":"OpenClawMax Setup *.exe"},
+      {"target":"mac","os":"macos-latest","artifact":"OpenClawMax-*.dmg"},
+      {"target":"linux","os":"ubuntu-latest","artifact":"OpenClawMax-*.AppImage"}
+    ]
+
 jobs:
+  # 根据触发方式计算要构建的平台矩阵：
+  #   - tag 触发（push）：全平台
+  #   - 手动触发：platform=all 全平台，否则只选中的那一个
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Compute matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          # 确定要构建的平台
+          if [ "${{ github.event_name }}" = "push" ]; then
+            SELECT="all"
+          else
+            SELECT="${{ github.event.inputs.platform }}"
+          fi
+          echo "selected platform: $SELECT"
+
+          # 从 ALL_PLATFORMS 里过滤
+          if [ "$SELECT" = "all" ]; then
+            MATRIX="$ALL_PLATFORMS"
+          else
+            # 用 node 精确过滤出 target 匹配的项（避免手写 jq 依赖）
+            MATRIX=$(node -e "
+              const all = JSON.parse(process.env.ALL_PLATFORMS);
+              const sel = process.argv[1];
+              const out = all.filter(p => p.target === sel);
+              process.stdout.write(JSON.stringify(out));
+            " "$SELECT")
+          fi
+          echo "matrix=$MATRIX"
+          # 多行字符串用 GITHUB_OUTPUT 的 delimiter 写法
+          {
+            echo "matrix<<EOF"
+            echo "$MATRIX"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false  # 一个平台失败不影响其他平台继续
       matrix:
-        include:
-          - os: windows-latest
-            target: win
-            artifact: 'OpenClawMax Setup *.exe'
-          - os: macos-latest
-            target: mac
-            artifact: 'OpenClawMax-*.dmg'
-          - os: ubuntu-latest
-            target: linux
-            artifact: 'OpenClawMax-*.AppImage'
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
-    runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
@@ -79,13 +134,13 @@ jobs:
           key: m2-${{ matrix.os }}-${{ hashFiles('**/pom.xml') }}
           restore-keys: m2-${{ matrix.os }}-
 
-      # JRE 缓存：每平台各下自己的 JRE（~50MB），按 os 缓存避免重复下载
+      # JRE 缓存：每平台各下自己的 JRE（~50MB），按 target 缓存避免重复下载
       - name: Cache JRE
         id: cache-jre
         uses: actions/cache@v4
         with:
           path: mateclaw-desktop/resources/jre
-          key: jre-21-${{ matrix.target }}-${{ runner.os }}
+          key: jre-21-${{ matrix.target }}
 
       - name: Install desktop deps
         working-directory: mateclaw-desktop
@@ -96,7 +151,6 @@ jobs:
         working-directory: mateclaw-desktop
         run: npm run build:desktop
         env:
-          # CI 上 JRE 已缓存时，build-desktop 的 step4 会检测到 jre 存在并跳过下载
           # 不签名：留空即可，electron-builder 自动跳过签名
           CSC_LINK: ''
           CSC_KEY_PASSWORD: ''

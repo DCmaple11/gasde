@@ -23,9 +23,12 @@ const JRE_DIR = path.join(RESOURCES_DIR, 'jre');
 // 清华镜像固定版本号（国内首选，速度快；不走 API latest，用确定版本）
 const TUNA_JRE_BUILD = '21.0.11_10'; // OpenJDK21U-jre_x64_windows_hotspot_21.0.11_10
 
-// 把 platform/arch 映射到 Adoptium 的 os/arch 标识
+// 把 platform/arch 映射到 Adoptium 的 os/arch 标识。
+// 注意：Adoptium API 用 aarch64（不是 arm64），process.arch 返回的是 arm64，需转换。
+// 文件名里 Windows 用 x64，mac/linux 用 aarch64 / x64。
 function mapPlatform() {
-  const arch = process.arch; // arm64 | x64
+  const rawArch = process.arch; // arm64 | x64
+  const arch = rawArch === 'arm64' ? 'aarch64' : rawArch; // Adoptium 命名规范
   const platformMap = {
     win32: { os: 'windows', arch, ext: '.zip' },
     darwin: { os: 'mac', arch, ext: '.tar.gz' },
@@ -33,7 +36,7 @@ function mapPlatform() {
   };
   const m = platformMap[process.platform];
   if (!m) {
-    console.error(`[download-jre] 不支持的平台: ${process.platform}/${arch}`);
+    console.error(`[download-jre] 不支持的平台: ${process.platform}/${rawArch}`);
     process.exit(1);
   }
   return m;
@@ -146,8 +149,14 @@ async function main() {
   // 清理上次失败残留的半截文件
   fs.rmSync(archivePath, { force: true });
 
-  // 优先清华镜像（国内快），失败回退 Adoptium 官方
-  const sources = [buildTunaUrl(m), buildAdoptiumUrl(m)];
+  // 下载源优先级：
+  //   默认 Adoptium 官方 API 优先 —— latest 永不过期，CI（海外 runner）访问快。
+  //   本地国内网络慢时，设环境变量 JRE_SOURCE=tuna 强制走清华镜像（速度快但版本号固定）。
+  //   两个源都尝试，任一成功即可。
+  const preferTuna = process.env.JRE_SOURCE === 'tuna';
+  const sources = preferTuna
+    ? [buildTunaUrl(m), buildAdoptiumUrl(m)]
+    : [buildAdoptiumUrl(m), buildTunaUrl(m)];
   let downloaded = false;
   for (let i = 0; i < sources.length; i++) {
     try {
