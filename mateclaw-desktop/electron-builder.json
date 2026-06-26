@@ -63,6 +63,9 @@
     "hardenedRuntime": false,
     "gatekeeperAssess": false
   },
+  "dmg": {
+    "sign": false
+  },
   "linux": {
     "target": [
       { "target": "AppImage", "arch": ["x64"] }

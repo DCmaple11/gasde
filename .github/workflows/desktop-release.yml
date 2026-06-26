@@ -151,11 +151,13 @@ jobs:
         working-directory: mateclaw-desktop
         run: npm run build:desktop
         env:
-          # 不签名：留空即可，electron-builder 自动跳过签名
+          # 不签名配置：
+          # CSC_IDENTITY_AUTO_DISCOVERY=false —— 关键！禁用 macOS 自动证书发现，
+          #   无证书 CI 环境下不尝试签名流程（否则会报 "not a file" 等错误）。
+          # CSC_LINK/CSC_KEY_PASSWORD 留空 —— 无证书直接跳过。
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
           CSC_LINK: ''
           CSC_KEY_PASSWORD: ''
-          # GitHub Token：electron-builder publish 用（仅 tag 触发时实际发布）
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # 上传构建产物（每个平台作为独立 artifact，便于下载验证）
       - name: Upload artifacts
