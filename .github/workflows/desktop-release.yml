@@ -151,13 +151,10 @@ jobs:
         working-directory: mateclaw-desktop
         run: npm run build:desktop
         env:
-          # 不签名配置：
-          # CSC_IDENTITY_AUTO_DISCOVERY=false —— 关键！禁用 macOS 自动证书发现，
-          #   无证书 CI 环境下不尝试签名流程（否则会报 "not a file" 等错误）。
-          # CSC_LINK/CSC_KEY_PASSWORD 留空 —— 无证书直接跳过。
+          # macOS 不签名：electron-builder.json 里已配 mac.identity=null（官方"跳过签名"开关）。
+          # 这里 CSC_IDENTITY_AUTO_DISCOVERY=false 作双保险，彻底禁用证书自动发现。
+          # 注意：CSC_LINK 必须完全不设（不能设空串），空串会让 codesign 把 cwd 当证书读 → "not a file"。
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-          CSC_LINK: ''
-          CSC_KEY_PASSWORD: ''
 
       # 上传构建产物（每个平台作为独立 artifact，便于下载验证）
       - name: Upload artifacts

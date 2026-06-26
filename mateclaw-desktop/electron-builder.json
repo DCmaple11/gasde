@@ -60,6 +60,7 @@
       { "target": "zip", "arch": ["arm64"] }
     ],
     "icon": "build/icon.png",
+    "identity": null,
     "hardenedRuntime": false,
     "gatekeeperAssess": false
   },
