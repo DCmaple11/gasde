@@ -1,6 +1,6 @@
 {
   "name": "mateclaw-desktop",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "OpenClawMax desktop shell — wraps the Spring Boot backend jar in an Electron app with a bundled JRE.",
   "private": true,
   "author": "OpenClawMax",
