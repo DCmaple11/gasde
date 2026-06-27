@@ -73,5 +73,9 @@
     ],
     "icon": "build/icon.png",
     "category": "Office"
+  },
+  "publish": {
+    "provider": "generic",
+    "url": "https://oss.aipowerway.cn/version/latest/"
   }
 }

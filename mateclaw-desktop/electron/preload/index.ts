@@ -1,14 +1,22 @@
-// Preload —— 渲染进程与主进程之间的最小 IPC 桥。
+// Preload —— 渲染进程与主进程之间的 IPC 桥。
 //
-// P0 仅暴露应用信息（版本/平台）。contextIsolation=true 下，渲染进程只能通过
-// window.mateclawDesktop 访问这里显式暴露的能力，无法直接用 Node/Electron API。
+// contextIsolation=true 下，渲染进程只能通过 window.mateclawDesktop 访问这里
+// 显式暴露的能力，无法直接用 Node/Electron API。
 
-import { contextBridge } from 'electron';
+import { contextBridge, ipcRenderer } from 'electron';
 
-// preload 运行在渲染进程沙箱里，不能 import app（仅主进程可用）。
-// process.versions 在 preload 上下文里是安全的。
 contextBridge.exposeInMainWorld('mateclawDesktop', {
   platform: process.platform,
   electron: process.versions.electron,
-  // P4 自动更新、UI OTA 等能力会从这里继续扩展
+
+  // P4 自动更新：前端可主动检查更新、触发下载、监听下载进度
+  updater: {
+    check: (): Promise<{ supported: boolean; available?: boolean; version?: string; reason?: string; error?: string }> =>
+      ipcRenderer.invoke('updater:check'),
+    download: (): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('updater:download'),
+    onDownloadProgress: (callback: (percent: number) => void): void => {
+      ipcRenderer.on('update-download-progress', (_e, percent) => callback(percent));
+    },
+  },
 });

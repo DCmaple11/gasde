@@ -54,6 +54,13 @@ export function createTray(getMainWindow: () => BrowserWindow | null): Tray {
       label: '显示主窗口',
       click: showMainWindow,
     },
+    {
+      label: '检查更新',
+      click: () => {
+        // 懒加载避免与 updater.ts 的循环依赖
+        require('./updater').checkForUpdates();
+      },
+    },
     { type: 'separator' },
     {
       label: '退出 OpenClawMax',

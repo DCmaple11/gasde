@@ -45,9 +45,9 @@ concurrency:
 env:
   ALL_PLATFORMS: >-
     [
-      {"target":"win","os":"windows-latest","artifact":"OpenClawMax Setup *.exe"},
-      {"target":"mac","os":"macos-latest","artifact":"OpenClawMax-*.dmg"},
-      {"target":"linux","os":"ubuntu-latest","artifact":"OpenClawMax-*.AppImage"}
+      {"target":"win","os":"windows-latest","artifact":"OpenClawMax Setup *.exe","manifest":"latest.yml"},
+      {"target":"mac","os":"macos-latest","artifact":"OpenClawMax-*.dmg","manifest":"latest-mac.yml"},
+      {"target":"linux","os":"ubuntu-latest","artifact":"OpenClawMax-*.AppImage","manifest":"latest-linux.yml"}
     ]
 
 jobs:
@@ -165,14 +165,52 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # 发布到 GitHub Release（仅 tag 触发时）
+      # 发布到 GitHub Release（仅 tag 触发时）。
+      # files 同时含安装包 + electron-updater 的清单文件（latest*.yml），
+      # 否则客户端无法检查更新。
       - name: Publish to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: mateclaw-desktop/release/${{ matrix.artifact }}
+          files: |
+            mateclaw-desktop/release/${{ matrix.artifact }}
+            mateclaw-desktop/release/${{ matrix.manifest }}
           generate_release_notes: true
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 同步 Windows 安装包到阿里云 OSS（仅 tag 触发）。
+      # electron-updater 客户端从 oss.aipowerway.cn/version/latest/ 检查更新+下载。
+      # 只传最终的 .exe 安装包 + latest.yml（不传 win-unpacked 子目录等中间产物）。
+      # 需在 GitHub 仓库 Secrets 配置：
+      #   OSS_ACCESS_KEY_ID     —— OSS AccessKey ID（有写权限）
+      #   OSS_ACCESS_KEY_SECRET —— OSS AccessKey Secret
+      #   OSS_BUCKET            —— bucket 名（如 aipowerway）
+      #   OSS_ENDPOINT          —— region（如 oss-cn-hangzhou，不带 .aliyuncs.com）
+      - name: Sync Windows assets to Aliyun OSS
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.target == 'win'
+        uses: tvrcgo/oss-action@master
+        with:
+          key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          region: ${{ secrets.OSS_ENDPOINT }}
+          bucket: ${{ secrets.OSS_BUCKET }}
+          assets: |
+            mateclaw-desktop/release/*.exe:/version/latest/
+            mateclaw-desktop/release/latest.yml:/version/latest/
+
+      # 同步 Linux 安装包到阿里云 OSS
+      - name: Sync Linux assets to Aliyun OSS
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.target == 'linux'
+        uses: tvrcgo/oss-action@master
+        with:
+          key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          region: ${{ secrets.OSS_ENDPOINT }}
+          bucket: ${{ secrets.OSS_BUCKET }}
+          assets: |
+            mateclaw-desktop/release/*.AppImage:/version/latest/
+            mateclaw-desktop/release/latest-linux.yml:/version/latest/
+

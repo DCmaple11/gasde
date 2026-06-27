@@ -12,6 +12,7 @@ import path from 'node:path';
 import { isDev, DEV_FRONTEND_URL, DEV_BACKEND_PORT } from '../common/env';
 import { startBackend, killBackend } from './backend';
 import { createTray, handleClose, getIsQuitting, setIsQuitting, destroyTray } from './tray';
+import { initAutoUpdater } from './updater';
 import { resolveResourcePath } from './paths';
 import { writeLog } from './logger';
 
@@ -50,6 +51,9 @@ async function bootstrap(): Promise<void> {
 
   // 创建系统托盘（点 X 最小化到托盘，后端继续运行）
   createTray(() => mainWindow);
+
+  // 初始化自动更新（打包产物 + 非 macOS 才启用；启动后延迟 10s 静默检查）
+  initAutoUpdater(() => mainWindow);
 
   // 加载失败不能静默 —— 否则只剩白屏无从排查
   try {
